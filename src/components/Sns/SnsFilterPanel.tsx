@@ -7,6 +7,7 @@ interface Contact {
     username: string
     displayName: string
     avatarUrl?: string
+    postCount?: number
 }
 
 interface SnsFilterPanelProps {
@@ -150,7 +151,10 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
                                 onClick={() => toggleUserSelection(contact.username)}
                             >
                                 <Avatar src={contact.avatarUrl} name={contact.displayName} size={36} shape="rounded" />
-                                <span className="contact-name">{contact.displayName}</span>
+                                <div className="contact-meta">
+                                    <span className="contact-name">{contact.displayName}</span>
+                                    <span className="contact-post-count">{Math.max(0, Number(contact.postCount || 0))} 条</span>
+                                </div>
                             </div>
                         ))}
                         {filteredContacts.length === 0 && (

@@ -407,6 +407,40 @@ class SnsService {
         return { success: true, usernames: result.rows.map((r: any) => r.user_name).filter(Boolean) }
     }
 
+    async getUserPostCounts(): Promise<{ success: boolean; data?: Record<string, number>; error?: string }> {
+        try {
+            const counts: Record<string, number> = {}
+            const primary = await wcdbService.execQuery(
+                'sns',
+                null,
+                "SELECT user_name AS username, COUNT(1) AS total FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> '' GROUP BY user_name"
+            )
+
+            let rows = primary.rows
+            if (!primary.success || !rows) {
+                const fallback = await wcdbService.execQuery(
+                    'sns',
+                    null,
+                    "SELECT userName AS username, COUNT(1) AS total FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> '' GROUP BY userName"
+                )
+                if (!fallback.success || !fallback.rows) {
+                    return { success: false, error: primary.error || fallback.error || '获取朋友圈联系人条数失败' }
+                }
+                rows = fallback.rows
+            }
+
+            for (const row of rows) {
+                const usernameRaw = row?.username ?? row?.user_name ?? row?.userName ?? ''
+                const username = typeof usernameRaw === 'string' ? usernameRaw.trim() : String(usernameRaw || '').trim()
+                if (!username) continue
+                counts[username] = this.parseCountValue(row)
+            }
+            return { success: true, data: counts }
+        } catch (e) {
+            return { success: false, error: String(e) }
+        }
+    }
+
     private async getExportStatsFromTableCount(): Promise<{ totalPosts: number; totalFriends: number }> {
         let totalPosts = 0
         let totalFriends = 0

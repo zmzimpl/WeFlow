@@ -11,6 +11,7 @@ interface Contact {
     displayName: string
     avatarUrl?: string
     type?: 'friend' | 'former_friend' | 'sns_only'
+    postCount: number
 }
 
 interface SnsOverviewStats {
@@ -251,11 +252,16 @@ export default function SnsPage() {
     const loadContacts = useCallback(async () => {
         setContactsLoading(true)
         try {
-            // 并行获取联系人列表和朋友圈发布者列表
-            const [contactsResult, snsResult] = await Promise.all([
+            // 并行获取联系人列表、朋友圈发布者列表和每个发布者的动态条数
+            const [contactsResult, snsResult, snsCountsResult] = await Promise.all([
                 window.electronAPI.chat.getContacts(),
-                window.electronAPI.sns.getSnsUsernames()
+                window.electronAPI.sns.getSnsUsernames(),
+                window.electronAPI.sns.getUserPostCounts()
             ])
+            const snsPostCountMap = new Map<string, number>(
+                Object.entries(snsCountsResult.success ? (snsCountsResult.data || {}) : {})
+                    .map(([username, count]) => [username, Math.max(0, Number(count || 0))])
+            )
 
             // 以联系人为基础，按 username 去重
             const contactMap = new Map<string, Contact>()
@@ -268,7 +274,8 @@ export default function SnsPage() {
                             username: c.username,
                             displayName: c.displayName,
                             avatarUrl: c.avatarUrl,
-                            type: c.type === 'former_friend' ? 'former_friend' : 'friend'
+                            type: c.type === 'former_friend' ? 'former_friend' : 'friend',
+                            postCount: snsPostCountMap.get(c.username) || 0
                         })
                     }
                 }
@@ -278,7 +285,7 @@ export default function SnsPage() {
             if (snsResult.success && snsResult.usernames) {
                 for (const u of snsResult.usernames) {
                     if (!contactMap.has(u)) {
-                        contactMap.set(u, { username: u, displayName: u, type: 'sns_only' })
+                        contactMap.set(u, { username: u, displayName: u, type: 'sns_only', postCount: snsPostCountMap.get(u) || 0 })
                     }
                 }
             }
