@@ -1167,6 +1167,40 @@ export class WcdbCore {
     }
   }
 
+  async getMessageCounts(sessionIds: string[]): Promise<{ success: boolean; counts?: Record<string, number>; error?: string }> {
+    if (!this.ensureReady()) {
+      return { success: false, error: 'WCDB 未连接' }
+    }
+
+    const normalizedSessionIds = Array.from(
+      new Set(
+        (sessionIds || [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      )
+    )
+    if (normalizedSessionIds.length === 0) {
+      return { success: true, counts: {} }
+    }
+
+    try {
+      const counts: Record<string, number> = {}
+      for (let i = 0; i < normalizedSessionIds.length; i += 1) {
+        const sessionId = normalizedSessionIds[i]
+        const outCount = [0]
+        const result = this.wcdbGetMessageCount(this.handle, sessionId, outCount)
+        counts[sessionId] = result === 0 && Number.isFinite(outCount[0]) ? Math.max(0, Math.floor(outCount[0])) : 0
+
+        if (i > 0 && i % 160 === 0) {
+          await new Promise(resolve => setImmediate(resolve))
+        }
+      }
+      return { success: true, counts }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
   async getDisplayNames(usernames: string[]): Promise<{ success: boolean; map?: Record<string, string>; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
@@ -2165,4 +2199,3 @@ export class WcdbCore {
     })
   }
 }
-

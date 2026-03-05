@@ -54,6 +54,9 @@ if (parentPort) {
                 case 'getMessageCount':
                     result = await core.getMessageCount(payload.sessionId)
                     break
+                case 'getMessageCounts':
+                    result = await core.getMessageCounts(payload.sessionIds)
+                    break
                 case 'getDisplayNames':
                     result = await core.getDisplayNames(payload.usernames)
                     break

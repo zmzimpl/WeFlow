@@ -198,11 +198,12 @@ export function GlobalSessionMonitor() {
                         // 尝试丰富或获取联系人详情
                         const contact = await window.electronAPI.chat.getContact(newSession.username)
                         if (contact) {
-                            if (contact.remark || contact.nickname) {
-                                title = contact.remark || contact.nickname
+                            if (contact.remark || contact.nickName) {
+                                title = contact.remark || contact.nickName
                             }
-                            if (contact.avatarUrl) {
-                                avatarUrl = contact.avatarUrl
+                            const avatarResult = await window.electronAPI.chat.getContactAvatar(newSession.username)
+                            if (avatarResult?.avatarUrl) {
+                                avatarUrl = avatarResult.avatarUrl
                             }
                         } else {
                             // 如果不在缓存/数据库中
@@ -222,8 +223,11 @@ export function GlobalSessionMonitor() {
                             if (title === newSession.username || title.startsWith('wxid_')) {
                                 const retried = await window.electronAPI.chat.getContact(newSession.username)
                                 if (retried) {
-                                    title = retried.remark || retried.nickname || title
-                                    avatarUrl = retried.avatarUrl || avatarUrl
+                                    title = retried.remark || retried.nickName || title
+                                    const retriedAvatar = await window.electronAPI.chat.getContactAvatar(newSession.username)
+                                    if (retriedAvatar?.avatarUrl) {
+                                        avatarUrl = retriedAvatar.avatarUrl
+                                    }
                                 }
                             }
                         }

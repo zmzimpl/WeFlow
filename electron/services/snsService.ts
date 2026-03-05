@@ -44,6 +44,68 @@ export interface SnsPost {
     linkUrl?: string
 }
 
+interface SnsContactIdentity {
+    username: string
+    wxid: string
+    alias?: string
+    wechatId?: string
+    remark?: string
+    nickName?: string
+    displayName: string
+}
+
+interface ParsedLikeUser {
+    username?: string
+    nickname?: string
+}
+
+interface ParsedCommentItem {
+    id: string
+    nickname: string
+    username?: string
+    content: string
+    refCommentId: string
+    refUsername?: string
+    refNickname?: string
+    emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[]
+}
+
+interface ArkmeLikeDetail {
+    nickname: string
+    username?: string
+    wxid?: string
+    alias?: string
+    wechatId?: string
+    remark?: string
+    nickName?: string
+    displayName: string
+    source: 'xml' | 'legacy'
+}
+
+interface ArkmeCommentDetail {
+    id: string
+    nickname: string
+    username?: string
+    wxid?: string
+    alias?: string
+    wechatId?: string
+    remark?: string
+    nickName?: string
+    displayName: string
+    content: string
+    refCommentId: string
+    refNickname?: string
+    refUsername?: string
+    refWxid?: string
+    refAlias?: string
+    refWechatId?: string
+    refRemark?: string
+    refNickName?: string
+    refDisplayName?: string
+    emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[]
+    source: 'xml' | 'legacy'
+}
+
 
 
 const fixSnsUrl = (url: string, token?: string, isVideo: boolean = false) => {
@@ -127,7 +189,7 @@ const extractVideoKey = (xml: string): string | undefined => {
 /**
  * 从 XML 中解析评论信息（含表情包、回复关系）
  */
-function parseCommentsFromXml(xml: string): { id: string; nickname: string; content: string; refCommentId: string; refNickname?: string; emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[] }[] {
+function parseCommentsFromXml(xml: string): ParsedCommentItem[] {
     if (!xml) return []
 
     type CommentItem = {
@@ -229,10 +291,260 @@ class SnsService {
     private configService: ConfigService
     private contactCache: ContactCacheService
     private imageCache = new Map<string, string>()
+    private exportStatsCache: { totalPosts: number; totalFriends: number; myPosts: number | null; updatedAt: number } | null = null
+    private readonly exportStatsCacheTtlMs = 5 * 60 * 1000
+    private lastTimelineFallbackAt = 0
+    private readonly timelineFallbackCooldownMs = 3 * 60 * 1000
 
     constructor() {
         this.configService = new ConfigService()
         this.contactCache = new ContactCacheService(this.configService.get('cachePath') as string)
+    }
+
+    private toOptionalString(value: unknown): string | undefined {
+        if (typeof value !== 'string') return undefined
+        const trimmed = value.trim()
+        return trimmed.length > 0 ? trimmed : undefined
+    }
+
+    private async resolveContactIdentity(
+        username: string,
+        identityCache: Map<string, Promise<SnsContactIdentity | null>>
+    ): Promise<SnsContactIdentity | null> {
+        const normalized = String(username || '').trim()
+        if (!normalized) return null
+
+        let pending = identityCache.get(normalized)
+        if (!pending) {
+            pending = (async () => {
+                const cached = this.contactCache.get(normalized)
+                let alias: string | undefined
+                let remark: string | undefined
+                let nickName: string | undefined
+
+                try {
+                    const contactResult = await wcdbService.getContact(normalized)
+                    if (contactResult.success && contactResult.contact) {
+                        const contact = contactResult.contact
+                        alias = this.toOptionalString(contact.alias ?? contact.Alias)
+                        remark = this.toOptionalString(contact.remark ?? contact.Remark)
+                        nickName = this.toOptionalString(contact.nickName ?? contact.nick_name ?? contact.nickname ?? contact.NickName)
+                    }
+                } catch {
+                    // 联系人补全失败不影响导出
+                }
+
+                const displayName = remark || nickName || alias || cached?.displayName || normalized
+                return {
+                    username: normalized,
+                    wxid: normalized,
+                    alias,
+                    wechatId: alias,
+                    remark,
+                    nickName,
+                    displayName
+                }
+            })()
+            identityCache.set(normalized, pending)
+        }
+
+        return pending
+    }
+
+    private parseLikeUsersFromXml(xml: string): ParsedLikeUser[] {
+        if (!xml) return []
+        const likes: ParsedLikeUser[] = []
+        try {
+            let likeListMatch = xml.match(/<LikeUserList>([\s\S]*?)<\/LikeUserList>/i)
+            if (!likeListMatch) likeListMatch = xml.match(/<likeUserList>([\s\S]*?)<\/likeUserList>/i)
+            if (!likeListMatch) likeListMatch = xml.match(/<likeList>([\s\S]*?)<\/likeList>/i)
+            if (!likeListMatch) likeListMatch = xml.match(/<like_user_list>([\s\S]*?)<\/like_user_list>/i)
+            if (!likeListMatch) return likes
+
+            const likeUserRegex = /<(?:LikeUser|likeUser|user_comment)>([\s\S]*?)<\/(?:LikeUser|likeUser|user_comment)>/gi
+            let m: RegExpExecArray | null
+            while ((m = likeUserRegex.exec(likeListMatch[1])) !== null) {
+                const block = m[1]
+                const username = this.toOptionalString(block.match(/<username>([^<]*)<\/username>/i)?.[1])
+                const nickname = this.toOptionalString(
+                    block.match(/<nickname>([^<]*)<\/nickname>/i)?.[1]
+                    || block.match(/<nickName>([^<]*)<\/nickName>/i)?.[1]
+                )
+                if (username || nickname) {
+                    likes.push({ username, nickname })
+                }
+            }
+        } catch (e) {
+            console.error('[SnsService] 解析点赞用户失败:', e)
+        }
+        return likes
+    }
+
+    private async buildArkmeInteractionDetails(
+        post: SnsPost,
+        identityCache: Map<string, Promise<SnsContactIdentity | null>>
+    ): Promise<{ likesDetail: ArkmeLikeDetail[]; commentsDetail: ArkmeCommentDetail[] }> {
+        const xmlLikes = this.parseLikeUsersFromXml(post.rawXml || '')
+        const likeCandidates: ParsedLikeUser[] = xmlLikes.length > 0
+            ? xmlLikes
+            : (post.likes || []).map((nickname) => ({ nickname }))
+        const likeSource: 'xml' | 'legacy' = xmlLikes.length > 0 ? 'xml' : 'legacy'
+        const likesDetail: ArkmeLikeDetail[] = []
+        const likeSeen = new Set<string>()
+
+        for (const like of likeCandidates) {
+            const identity = like.username
+                ? await this.resolveContactIdentity(like.username, identityCache)
+                : null
+            const nickname = like.nickname || identity?.displayName || like.username || ''
+            const username = identity?.username || like.username
+            const key = `${username || ''}|${nickname}`
+            if (likeSeen.has(key)) continue
+            likeSeen.add(key)
+            likesDetail.push({
+                nickname,
+                username,
+                wxid: username,
+                alias: identity?.alias,
+                wechatId: identity?.wechatId,
+                remark: identity?.remark,
+                nickName: identity?.nickName,
+                displayName: identity?.displayName || nickname || username || '',
+                source: likeSource
+            })
+        }
+
+        const xmlComments = parseCommentsFromXml(post.rawXml || '')
+        const commentMap = new Map<string, SnsPost['comments'][number]>()
+        for (const comment of post.comments || []) {
+            if (comment.id) commentMap.set(comment.id, comment)
+        }
+
+        const commentsBase: ParsedCommentItem[] = xmlComments.length > 0
+            ? xmlComments.map((comment) => {
+                const fallback = comment.id ? commentMap.get(comment.id) : undefined
+                return {
+                    id: comment.id || fallback?.id || '',
+                    nickname: comment.nickname || fallback?.nickname || '',
+                    username: comment.username,
+                    content: comment.content || fallback?.content || '',
+                    refCommentId: comment.refCommentId || fallback?.refCommentId || '',
+                    refUsername: comment.refUsername,
+                    refNickname: comment.refNickname || fallback?.refNickname,
+                    emojis: comment.emojis && comment.emojis.length > 0 ? comment.emojis : fallback?.emojis
+                }
+            })
+            : (post.comments || []).map((comment) => ({
+                id: comment.id || '',
+                nickname: comment.nickname || '',
+                content: comment.content || '',
+                refCommentId: comment.refCommentId || '',
+                refNickname: comment.refNickname,
+                emojis: comment.emojis
+            }))
+
+        if (xmlComments.length > 0) {
+            const mappedIds = new Set(commentsBase.map((comment) => comment.id).filter(Boolean))
+            for (const comment of post.comments || []) {
+                if (comment.id && mappedIds.has(comment.id)) continue
+                commentsBase.push({
+                    id: comment.id || '',
+                    nickname: comment.nickname || '',
+                    content: comment.content || '',
+                    refCommentId: comment.refCommentId || '',
+                    refNickname: comment.refNickname,
+                    emojis: comment.emojis
+                })
+            }
+        }
+
+        const commentSource: 'xml' | 'legacy' = xmlComments.length > 0 ? 'xml' : 'legacy'
+        const commentsDetail: ArkmeCommentDetail[] = []
+
+        for (const comment of commentsBase) {
+            const actor = comment.username
+                ? await this.resolveContactIdentity(comment.username, identityCache)
+                : null
+            const refActor = comment.refUsername
+                ? await this.resolveContactIdentity(comment.refUsername, identityCache)
+                : null
+            const nickname = comment.nickname || actor?.displayName || comment.username || ''
+            const username = actor?.username || comment.username
+            const refUsername = refActor?.username || comment.refUsername
+            commentsDetail.push({
+                id: comment.id || '',
+                nickname,
+                username,
+                wxid: username,
+                alias: actor?.alias,
+                wechatId: actor?.wechatId,
+                remark: actor?.remark,
+                nickName: actor?.nickName,
+                displayName: actor?.displayName || nickname || username || '',
+                content: comment.content || '',
+                refCommentId: comment.refCommentId || '',
+                refNickname: comment.refNickname || refActor?.displayName,
+                refUsername,
+                refWxid: refUsername,
+                refAlias: refActor?.alias,
+                refWechatId: refActor?.wechatId,
+                refRemark: refActor?.remark,
+                refNickName: refActor?.nickName,
+                refDisplayName: refActor?.displayName,
+                emojis: comment.emojis,
+                source: commentSource
+            })
+        }
+
+        return { likesDetail, commentsDetail }
+    }
+
+    private parseCountValue(row: any): number {
+        if (!row || typeof row !== 'object') return 0
+        const raw = row.total ?? row.count ?? row.cnt ?? Object.values(row)[0]
+        const num = Number(raw)
+        return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0
+    }
+
+    private pickTimelineUsername(post: any): string {
+        const raw = post?.username ?? post?.user_name ?? post?.userName ?? ''
+        if (typeof raw !== 'string') return ''
+        return raw.trim()
+    }
+
+    private async getExportStatsFromTimeline(myWxid?: string): Promise<{ totalPosts: number; totalFriends: number; myPosts: number | null }> {
+        const pageSize = 500
+        const uniqueUsers = new Set<string>()
+        let totalPosts = 0
+        let myPosts = 0
+        let offset = 0
+        const normalizedMyWxid = this.toOptionalString(myWxid)
+
+        for (let round = 0; round < 2000; round++) {
+            const result = await wcdbService.getSnsTimeline(pageSize, offset, undefined, undefined, 0, 0)
+            if (!result.success || !Array.isArray(result.timeline)) {
+                throw new Error(result.error || '获取朋友圈统计失败')
+            }
+
+            const rows = result.timeline
+            if (rows.length === 0) break
+
+            totalPosts += rows.length
+            for (const row of rows) {
+                const username = this.pickTimelineUsername(row)
+                if (username) uniqueUsers.add(username)
+                if (normalizedMyWxid && username === normalizedMyWxid) myPosts += 1
+            }
+
+            if (rows.length < pageSize) break
+            offset += rows.length
+        }
+
+        return {
+            totalPosts,
+            totalFriends: uniqueUsers.size,
+            myPosts: normalizedMyWxid ? myPosts : null
+        }
     }
 
     private parseLikesFromXml(xml: string): string[] {
@@ -349,14 +661,207 @@ class SnsService {
     }
 
     async getSnsUsernames(): Promise<{ success: boolean; usernames?: string[]; error?: string }> {
-        const result = await wcdbService.execQuery('sns', null, 'SELECT DISTINCT user_name FROM SnsTimeLine')
-        if (!result.success || !result.rows) {
-            // 尝试 userName 列名
-            const result2 = await wcdbService.execQuery('sns', null, 'SELECT DISTINCT userName FROM SnsTimeLine')
-            if (!result2.success || !result2.rows) return { success: false, error: result.error || result2.error }
-            return { success: true, usernames: result2.rows.map((r: any) => r.userName).filter(Boolean) }
+        const collect = (rows?: any[]): string[] => {
+            if (!Array.isArray(rows)) return []
+            const usernames: string[] = []
+            for (const row of rows) {
+                const raw = row?.user_name ?? row?.userName ?? row?.username ?? Object.values(row || {})[0]
+                const username = typeof raw === 'string' ? raw.trim() : String(raw || '').trim()
+                if (username) usernames.push(username)
+            }
+            return usernames
         }
-        return { success: true, usernames: result.rows.map((r: any) => r.user_name).filter(Boolean) }
+
+        const primary = await wcdbService.execQuery(
+            'sns',
+            null,
+            "SELECT DISTINCT user_name FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
+        )
+        const fallback = await wcdbService.execQuery(
+            'sns',
+            null,
+            "SELECT DISTINCT userName FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
+        )
+
+        const merged = Array.from(new Set([
+            ...collect(primary.rows),
+            ...collect(fallback.rows)
+        ]))
+
+        // 任一查询成功且拿到用户名即视为成功，避免因为列名差异导致误判为空。
+        if (merged.length > 0) {
+            return { success: true, usernames: merged }
+        }
+
+        // 两条查询都成功但无数据，说明确实没有朋友圈发布者。
+        if (primary.success || fallback.success) {
+            return { success: true, usernames: [] }
+        }
+
+        return { success: false, error: primary.error || fallback.error || '获取朋友圈联系人失败' }
+    }
+
+    private async getExportStatsFromTableCount(myWxid?: string): Promise<{ totalPosts: number; totalFriends: number; myPosts: number | null }> {
+        let totalPosts = 0
+        let totalFriends = 0
+        let myPosts: number | null = null
+
+        const postCountResult = await wcdbService.execQuery('sns', null, 'SELECT COUNT(1) AS total FROM SnsTimeLine')
+        if (postCountResult.success && postCountResult.rows && postCountResult.rows.length > 0) {
+            totalPosts = this.parseCountValue(postCountResult.rows[0])
+        }
+
+        if (totalPosts > 0) {
+            const friendCountPrimary = await wcdbService.execQuery(
+                'sns',
+                null,
+                "SELECT COUNT(DISTINCT user_name) AS total FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
+            )
+            if (friendCountPrimary.success && friendCountPrimary.rows && friendCountPrimary.rows.length > 0) {
+                totalFriends = this.parseCountValue(friendCountPrimary.rows[0])
+            } else {
+                const friendCountFallback = await wcdbService.execQuery(
+                    'sns',
+                    null,
+                    "SELECT COUNT(DISTINCT userName) AS total FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
+                )
+                if (friendCountFallback.success && friendCountFallback.rows && friendCountFallback.rows.length > 0) {
+                    totalFriends = this.parseCountValue(friendCountFallback.rows[0])
+                }
+            }
+        }
+
+        const normalizedMyWxid = this.toOptionalString(myWxid)
+        if (normalizedMyWxid) {
+            const myPostPrimary = await wcdbService.execQuery(
+                'sns',
+                null,
+                "SELECT COUNT(1) AS total FROM SnsTimeLine WHERE user_name = ?",
+                [normalizedMyWxid]
+            )
+            if (myPostPrimary.success && myPostPrimary.rows && myPostPrimary.rows.length > 0) {
+                myPosts = this.parseCountValue(myPostPrimary.rows[0])
+            } else {
+                const myPostFallback = await wcdbService.execQuery(
+                    'sns',
+                    null,
+                    "SELECT COUNT(1) AS total FROM SnsTimeLine WHERE userName = ?",
+                    [normalizedMyWxid]
+                )
+                if (myPostFallback.success && myPostFallback.rows && myPostFallback.rows.length > 0) {
+                    myPosts = this.parseCountValue(myPostFallback.rows[0])
+                }
+            }
+        }
+
+        return { totalPosts, totalFriends, myPosts }
+    }
+
+    async getExportStats(options?: {
+        allowTimelineFallback?: boolean
+        preferCache?: boolean
+    }): Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number; myPosts: number | null }; error?: string }> {
+        const allowTimelineFallback = options?.allowTimelineFallback ?? true
+        const preferCache = options?.preferCache ?? false
+        const now = Date.now()
+        const myWxid = this.toOptionalString(this.configService.get('myWxid'))
+
+        try {
+            if (preferCache && this.exportStatsCache && now - this.exportStatsCache.updatedAt <= this.exportStatsCacheTtlMs) {
+                return {
+                    success: true,
+                    data: {
+                        totalPosts: this.exportStatsCache.totalPosts,
+                        totalFriends: this.exportStatsCache.totalFriends,
+                        myPosts: this.exportStatsCache.myPosts
+                    }
+                }
+            }
+
+            let { totalPosts, totalFriends, myPosts } = await this.getExportStatsFromTableCount(myWxid)
+            let fallbackAttempted = false
+            let fallbackError = ''
+
+            // 某些环境下 SnsTimeLine 统计查询会返回 0，这里在允许时回退到与导出同源的 timeline 接口统计。
+            if (
+                allowTimelineFallback &&
+                (totalPosts <= 0 || totalFriends <= 0) &&
+                now - this.lastTimelineFallbackAt >= this.timelineFallbackCooldownMs
+            ) {
+                fallbackAttempted = true
+                try {
+                    const timelineStats = await this.getExportStatsFromTimeline(myWxid)
+                    this.lastTimelineFallbackAt = Date.now()
+                    if (timelineStats.totalPosts > 0) {
+                        totalPosts = timelineStats.totalPosts
+                    }
+                    if (timelineStats.totalFriends > 0) {
+                        totalFriends = timelineStats.totalFriends
+                    }
+                    if (timelineStats.myPosts !== null) {
+                        myPosts = timelineStats.myPosts
+                    }
+                } catch (error) {
+                    fallbackError = String(error)
+                    console.error('[SnsService] getExportStats timeline fallback failed:', error)
+                }
+            }
+
+            const normalizedStats = {
+                totalPosts: Math.max(0, Number(totalPosts || 0)),
+                totalFriends: Math.max(0, Number(totalFriends || 0)),
+                myPosts: myWxid
+                    ? (myPosts === null ? null : Math.max(0, Number(myPosts || 0)))
+                    : null
+            }
+            const computedHasData = normalizedStats.totalPosts > 0 || normalizedStats.totalFriends > 0
+            const cacheHasData = !!this.exportStatsCache && (this.exportStatsCache.totalPosts > 0 || this.exportStatsCache.totalFriends > 0)
+
+            // 计算结果全 0 时，优先使用已有非零缓存，避免瞬时异常覆盖有效统计。
+            if (!computedHasData && cacheHasData && this.exportStatsCache) {
+                return {
+                    success: true,
+                    data: {
+                        totalPosts: this.exportStatsCache.totalPosts,
+                        totalFriends: this.exportStatsCache.totalFriends,
+                        myPosts: this.exportStatsCache.myPosts
+                    }
+                }
+            }
+
+            // 当主查询结果全 0 且回退统计执行失败时，返回失败给前端显示明确状态（而非错误地展示 0）。
+            if (!computedHasData && fallbackAttempted && fallbackError) {
+                return { success: false, error: fallbackError }
+            }
+
+            this.exportStatsCache = {
+                totalPosts: normalizedStats.totalPosts,
+                totalFriends: normalizedStats.totalFriends,
+                myPosts: normalizedStats.myPosts,
+                updatedAt: Date.now()
+            }
+
+            return { success: true, data: normalizedStats }
+        } catch (e) {
+            if (this.exportStatsCache) {
+                return {
+                    success: true,
+                    data: {
+                        totalPosts: this.exportStatsCache.totalPosts,
+                        totalFriends: this.exportStatsCache.totalFriends,
+                        myPosts: this.exportStatsCache.myPosts
+                    }
+                }
+            }
+            return { success: false, error: String(e) }
+        }
+    }
+
+    async getExportStatsFast(): Promise<{ success: boolean; data?: { totalPosts: number; totalFriends: number; myPosts: number | null }; error?: string }> {
+        return this.getExportStats({
+            allowTimelineFallback: false,
+            preferCache: true
+        })
     }
 
     // 安装朋友圈删除拦截
@@ -563,14 +1068,44 @@ class SnsService {
      */
     async exportTimeline(options: {
         outputDir: string
-        format: 'json' | 'html'
+        format: 'json' | 'html' | 'arkmejson'
         usernames?: string[]
         keyword?: string
         exportMedia?: boolean
+        exportImages?: boolean
+        exportLivePhotos?: boolean
+        exportVideos?: boolean
         startTime?: number
         endTime?: number
-    }, progressCallback?: (progress: { current: number; total: number; status: string }) => void): Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; error?: string }> {
-        const { outputDir, format, usernames, keyword, exportMedia = false, startTime, endTime } = options
+    }, progressCallback?: (progress: { current: number; total: number; status: string }) => void, control?: {
+        shouldPause?: () => boolean
+        shouldStop?: () => boolean
+    }): Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; paused?: boolean; stopped?: boolean; error?: string }> {
+        const { outputDir, format, usernames, keyword, startTime, endTime } = options
+        const hasExplicitMediaSelection =
+            typeof options.exportImages === 'boolean' ||
+            typeof options.exportLivePhotos === 'boolean' ||
+            typeof options.exportVideos === 'boolean'
+        const shouldExportImages = hasExplicitMediaSelection
+            ? options.exportImages === true
+            : options.exportMedia === true
+        const shouldExportLivePhotos = hasExplicitMediaSelection
+            ? options.exportLivePhotos === true
+            : options.exportMedia === true
+        const shouldExportVideos = hasExplicitMediaSelection
+            ? options.exportVideos === true
+            : options.exportMedia === true
+        const shouldExportMedia = shouldExportImages || shouldExportLivePhotos || shouldExportVideos
+        const getControlState = (): 'paused' | 'stopped' | null => {
+            if (control?.shouldStop?.()) return 'stopped'
+            if (control?.shouldPause?.()) return 'paused'
+            return null
+        }
+        const buildInterruptedResult = (state: 'paused' | 'stopped', postCount: number, mediaCount: number) => (
+            state === 'stopped'
+                ? { success: true, stopped: true, filePath: '', postCount, mediaCount }
+                : { success: true, paused: true, filePath: '', postCount, mediaCount }
+        )
 
         try {
             // 确保输出目录存在
@@ -587,6 +1122,10 @@ class SnsService {
             progressCallback?.({ current: 0, total: 0, status: '正在加载朋友圈数据...' })
 
             while (hasMore) {
+                const controlState = getControlState()
+                if (controlState) {
+                    return buildInterruptedResult(controlState, allPosts.length, 0)
+                }
                 const result = await this.getTimeline(pageSize, 0, usernames, keyword, startTime, endTs)
                 if (result.success && result.timeline && result.timeline.length > 0) {
                     allPosts.push(...result.timeline)
@@ -614,15 +1153,54 @@ class SnsService {
             let mediaCount = 0
             const mediaDir = join(outputDir, 'media')
 
-            if (exportMedia) {
+            if (shouldExportMedia) {
                 if (!existsSync(mediaDir)) {
                     mkdirSync(mediaDir, { recursive: true })
                 }
 
                 // 收集所有媒体下载任务
-                const mediaTasks: { media: SnsMedia; postId: string; mi: number }[] = []
+                const mediaTasks: Array<{
+                    kind: 'image' | 'video' | 'livephoto'
+                    media: SnsMedia
+                    url: string
+                    key?: string
+                    postId: string
+                    mi: number
+                }> = []
                 for (const post of allPosts) {
-                    post.media.forEach((media, mi) => mediaTasks.push({ media, postId: post.id, mi }))
+                    post.media.forEach((media, mi) => {
+                        const isVideo = isVideoUrl(media.url)
+                        if (shouldExportImages && !isVideo && media.url) {
+                            mediaTasks.push({
+                                kind: 'image',
+                                media,
+                                url: media.url,
+                                key: media.key,
+                                postId: post.id,
+                                mi
+                            })
+                        }
+                        if (shouldExportVideos && isVideo && media.url) {
+                            mediaTasks.push({
+                                kind: 'video',
+                                media,
+                                url: media.url,
+                                key: media.key,
+                                postId: post.id,
+                                mi
+                            })
+                        }
+                        if (shouldExportLivePhotos && media.livePhoto?.url) {
+                            mediaTasks.push({
+                                kind: 'livephoto',
+                                media,
+                                url: media.livePhoto.url,
+                                key: media.livePhoto.key || media.key,
+                                postId: post.id,
+                                mi
+                            })
+                        }
+                    })
                 }
 
                 // 并发下载（5路）
@@ -631,29 +1209,42 @@ class SnsService {
                 const runTask = async (task: typeof mediaTasks[0]) => {
                     const { media, postId, mi } = task
                     try {
-                        const isVideo = isVideoUrl(media.url)
+                        const isVideo = task.kind === 'video' || task.kind === 'livephoto' || isVideoUrl(task.url)
                         const ext = isVideo ? 'mp4' : 'jpg'
-                        const fileName = `${postId}_${mi}.${ext}`
+                        const suffix = task.kind === 'livephoto' ? '_live' : ''
+                        const fileName = `${postId}_${mi}${suffix}.${ext}`
                         const filePath = join(mediaDir, fileName)
 
                         if (existsSync(filePath)) {
-                            ;(media as any).localPath = `media/${fileName}`
+                            if (task.kind === 'livephoto') {
+                                if (media.livePhoto) (media.livePhoto as any).localPath = `media/${fileName}`
+                            } else {
+                                ;(media as any).localPath = `media/${fileName}`
+                            }
                             mediaCount++
                         } else {
-                            const result = await this.fetchAndDecryptImage(media.url, media.key)
+                            const result = await this.fetchAndDecryptImage(task.url, task.key)
                             if (result.success && result.data) {
                                 await writeFile(filePath, result.data)
-                                ;(media as any).localPath = `media/${fileName}`
+                                if (task.kind === 'livephoto') {
+                                    if (media.livePhoto) (media.livePhoto as any).localPath = `media/${fileName}`
+                                } else {
+                                    ;(media as any).localPath = `media/${fileName}`
+                                }
                                 mediaCount++
                             } else if (result.success && result.cachePath) {
                                 const cachedData = await readFile(result.cachePath)
                                 await writeFile(filePath, cachedData)
-                                ;(media as any).localPath = `media/${fileName}`
+                                if (task.kind === 'livephoto') {
+                                    if (media.livePhoto) (media.livePhoto as any).localPath = `media/${fileName}`
+                                } else {
+                                    ;(media as any).localPath = `media/${fileName}`
+                                }
                                 mediaCount++
                             }
                         }
                     } catch (e) {
-                        console.warn(`[SnsExport] 媒体下载失败: ${task.media.url}`, e)
+                        console.warn(`[SnsExport] 媒体下载失败: ${task.url}`, e)
                     }
                     done++
                     progressCallback?.({ current: done, total: mediaTasks.length, status: `正在下载媒体 (${done}/${mediaTasks.length})...` })
@@ -663,11 +1254,18 @@ class SnsService {
                 const queue = [...mediaTasks]
                 const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
                     while (queue.length > 0) {
+                        const controlState = getControlState()
+                        if (controlState) return controlState
                         const task = queue.shift()!
                         await runTask(task)
                     }
+                    return null
                 })
-                await Promise.all(workers)
+                const workerResults = await Promise.all(workers)
+                const interruptedState = workerResults.find(state => state === 'paused' || state === 'stopped')
+                if (interruptedState) {
+                    return buildInterruptedResult(interruptedState, allPosts.length, mediaCount)
+                }
             }
 
             // 2.5 下载头像
@@ -679,6 +1277,8 @@ class SnsService {
                 const avatarQueue = [...uniqueUsers]
                 const avatarWorkers = Array.from({ length: Math.min(5, avatarQueue.length) }, async () => {
                     while (avatarQueue.length > 0) {
+                        const controlState = getControlState()
+                        if (controlState) return controlState
                         const post = avatarQueue.shift()!
                         try {
                             const fileName = `avatar_${crypto.createHash('md5').update(post.username).digest('hex').slice(0, 8)}.jpg`
@@ -696,11 +1296,20 @@ class SnsService {
                         avatarDone++
                         progressCallback?.({ current: avatarDone, total: uniqueUsers.length, status: `正在下载头像 (${avatarDone}/${uniqueUsers.length})...` })
                     }
+                    return null
                 })
-                await Promise.all(avatarWorkers)
+                const avatarWorkerResults = await Promise.all(avatarWorkers)
+                const interruptedState = avatarWorkerResults.find(state => state === 'paused' || state === 'stopped')
+                if (interruptedState) {
+                    return buildInterruptedResult(interruptedState, allPosts.length, mediaCount)
+                }
             }
 
             // 3. 生成输出文件
+            const finalControlState = getControlState()
+            if (finalControlState) {
+                return buildInterruptedResult(finalControlState, allPosts.length, mediaCount)
+            }
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
             let outputFilePath: string
 
@@ -731,6 +1340,92 @@ class SnsService {
                         linkTitle: (p as any).linkTitle,
                         linkUrl: (p as any).linkUrl
                     }))
+                }
+                await writeFile(outputFilePath, JSON.stringify(exportData, null, 2), 'utf-8')
+            } else if (format === 'arkmejson') {
+                outputFilePath = join(outputDir, `朋友圈导出_${timestamp}.json`)
+                progressCallback?.({ current: 0, total: allPosts.length, status: '正在构建 ArkmeJSON 数据...' })
+
+                const identityCache = new Map<string, Promise<SnsContactIdentity | null>>()
+                const posts: any[] = []
+                let built = 0
+
+                for (const post of allPosts) {
+                    const controlState = getControlState()
+                    if (controlState) {
+                        return buildInterruptedResult(controlState, allPosts.length, mediaCount)
+                    }
+
+                    const authorIdentity = await this.resolveContactIdentity(post.username, identityCache)
+                    const { likesDetail, commentsDetail } = await this.buildArkmeInteractionDetails(post, identityCache)
+
+                    posts.push({
+                        id: post.id,
+                        username: post.username,
+                        nickname: post.nickname,
+                        author: authorIdentity
+                            ? {
+                                ...authorIdentity
+                            }
+                            : {
+                                username: post.username,
+                                wxid: post.username,
+                                displayName: post.nickname || post.username
+                            },
+                        createTime: post.createTime,
+                        createTimeStr: new Date(post.createTime * 1000).toLocaleString('zh-CN'),
+                        contentDesc: post.contentDesc,
+                        type: post.type,
+                        media: post.media.map(m => ({
+                            url: m.url,
+                            thumb: m.thumb,
+                            localPath: (m as any).localPath || undefined,
+                            livePhoto: m.livePhoto ? {
+                                url: m.livePhoto.url,
+                                thumb: m.livePhoto.thumb,
+                                localPath: (m.livePhoto as any).localPath || undefined
+                            } : undefined
+                        })),
+                        likes: post.likes,
+                        comments: post.comments,
+                        likesDetail,
+                        commentsDetail,
+                        linkTitle: (post as any).linkTitle,
+                        linkUrl: (post as any).linkUrl
+                    })
+
+                    built++
+                    if (built % 20 === 0 || built === allPosts.length) {
+                        progressCallback?.({ current: built, total: allPosts.length, status: `正在构建 ArkmeJSON 数据 (${built}/${allPosts.length})...` })
+                    }
+                }
+
+                const ownerWxid = this.toOptionalString(this.configService.get('myWxid'))
+                const ownerIdentity = ownerWxid
+                    ? await this.resolveContactIdentity(ownerWxid, identityCache)
+                    : null
+                const recordOwner = ownerIdentity
+                    ? { ...ownerIdentity }
+                    : ownerWxid
+                        ? { username: ownerWxid, wxid: ownerWxid, displayName: ownerWxid }
+                        : { username: '', wxid: '', displayName: '' }
+
+                const exportData = {
+                    exportTime: new Date().toISOString(),
+                    format: 'arkmejson',
+                    schemaVersion: '1.0.0',
+                    recordOwner,
+                    mediaSelection: {
+                        images: shouldExportImages,
+                        livePhotos: shouldExportLivePhotos,
+                        videos: shouldExportVideos
+                    },
+                    totalPosts: allPosts.length,
+                    filters: {
+                        usernames: usernames || [],
+                        keyword: keyword || ''
+                    },
+                    posts
                 }
                 await writeFile(outputFilePath, JSON.stringify(exportData, null, 2), 'utf-8')
             } else {

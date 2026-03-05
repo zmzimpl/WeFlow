@@ -5,6 +5,11 @@ import './SnsPage.scss'
 import { SnsPost } from '../types/sns'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { SnsFilterPanel } from '../components/Sns/SnsFilterPanel'
+import * as configService from '../services/config'
+
+const SNS_PAGE_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const SNS_PAGE_CACHE_POST_LIMIT = 200
+const SNS_PAGE_CACHE_SCOPE_FALLBACK = '__default__'
 
 interface Contact {
     username: string
@@ -13,11 +18,29 @@ interface Contact {
     type?: 'friend' | 'former_friend' | 'sns_only'
 }
 
+interface SnsOverviewStats {
+    totalPosts: number
+    totalFriends: number
+    myPosts: number | null
+    earliestTime: number | null
+    latestTime: number | null
+}
+
+type OverviewStatsStatus = 'loading' | 'ready' | 'error'
+
 export default function SnsPage() {
     const [posts, setPosts] = useState<SnsPost[]>([])
     const [loading, setLoading] = useState(false)
     const [hasMore, setHasMore] = useState(true)
     const loadingRef = useRef(false)
+    const [overviewStats, setOverviewStats] = useState<SnsOverviewStats>({
+        totalPosts: 0,
+        totalFriends: 0,
+        myPosts: null,
+        earliestTime: null,
+        latestTime: null
+    })
+    const [overviewStatsStatus, setOverviewStatsStatus] = useState<OverviewStatsStatus>('loading')
 
     // Filter states
     const [searchKeyword, setSearchKeyword] = useState('')
@@ -35,9 +58,11 @@ export default function SnsPage() {
 
     // 导出相关状态
     const [showExportDialog, setShowExportDialog] = useState(false)
-    const [exportFormat, setExportFormat] = useState<'json' | 'html'>('html')
+    const [exportFormat, setExportFormat] = useState<'json' | 'html' | 'arkmejson'>('html')
     const [exportFolder, setExportFolder] = useState('')
-    const [exportMedia, setExportMedia] = useState(false)
+    const [exportImages, setExportImages] = useState(false)
+    const [exportLivePhotos, setExportLivePhotos] = useState(false)
+    const [exportVideos, setExportVideos] = useState(false)
     const [exportDateRange, setExportDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' })
     const [isExporting, setIsExporting] = useState(false)
     const [exportProgress, setExportProgress] = useState<{ current: number; total: number; status: string } | null>(null)
@@ -56,12 +81,34 @@ export default function SnsPage() {
     const [hasNewer, setHasNewer] = useState(false)
     const [loadingNewer, setLoadingNewer] = useState(false)
     const postsRef = useRef<SnsPost[]>([])
+    const overviewStatsRef = useRef<SnsOverviewStats>(overviewStats)
+    const overviewStatsStatusRef = useRef<OverviewStatsStatus>(overviewStatsStatus)
+    const selectedUsernamesRef = useRef<string[]>(selectedUsernames)
+    const searchKeywordRef = useRef(searchKeyword)
+    const jumpTargetDateRef = useRef<Date | undefined>(jumpTargetDate)
+    const cacheScopeKeyRef = useRef('')
     const scrollAdjustmentRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
+    const contactsLoadTokenRef = useRef(0)
 
     // Sync posts ref
     useEffect(() => {
         postsRef.current = posts
     }, [posts])
+    useEffect(() => {
+        overviewStatsRef.current = overviewStats
+    }, [overviewStats])
+    useEffect(() => {
+        overviewStatsStatusRef.current = overviewStatsStatus
+    }, [overviewStatsStatus])
+    useEffect(() => {
+        selectedUsernamesRef.current = selectedUsernames
+    }, [selectedUsernames])
+    useEffect(() => {
+        searchKeywordRef.current = searchKeyword
+    }, [searchKeyword])
+    useEffect(() => {
+        jumpTargetDateRef.current = jumpTargetDate
+    }, [jumpTargetDate])
     // 在 DOM 更新后、浏览器绘制前同步调整滚动位置，防止向上加载时页面跳动
     useLayoutEffect(() => {
         const snapshot = scrollAdjustmentRef.current;
@@ -74,6 +121,163 @@ export default function SnsPage() {
             scrollAdjustmentRef.current = null;
         }
     }, [posts])
+
+    const formatDateOnly = (timestamp: number | null): string => {
+        if (!timestamp || timestamp <= 0) return '--'
+        const date = new Date(timestamp * 1000)
+        if (Number.isNaN(date.getTime())) return '--'
+        const year = date.getFullYear()
+        const month = String(date.getMonth() + 1).padStart(2, '0')
+        const day = String(date.getDate()).padStart(2, '0')
+        return `${year}-${month}-${day}`
+    }
+
+    const isDefaultViewNow = useCallback(() => {
+        return selectedUsernamesRef.current.length === 0 && !searchKeywordRef.current.trim() && !jumpTargetDateRef.current
+    }, [])
+
+    const ensureSnsCacheScopeKey = useCallback(async () => {
+        if (cacheScopeKeyRef.current) return cacheScopeKeyRef.current
+        const wxid = (await configService.getMyWxid())?.trim() || SNS_PAGE_CACHE_SCOPE_FALLBACK
+        const scopeKey = `sns_page:${wxid}`
+        cacheScopeKeyRef.current = scopeKey
+        return scopeKey
+    }, [])
+
+    const persistSnsPageCache = useCallback(async (patch?: { posts?: SnsPost[]; overviewStats?: SnsOverviewStats }) => {
+        if (!isDefaultViewNow()) return
+        try {
+            const scopeKey = await ensureSnsCacheScopeKey()
+            if (!scopeKey) return
+            const existingCache = await configService.getSnsPageCache(scopeKey)
+            let postsToStore = patch?.posts ?? postsRef.current
+            if (!patch?.posts && postsToStore.length === 0) {
+                if (existingCache && Array.isArray(existingCache.posts) && existingCache.posts.length > 0) {
+                    postsToStore = existingCache.posts as SnsPost[]
+                }
+            }
+            const overviewToStore = patch?.overviewStats
+                ?? (overviewStatsStatusRef.current === 'ready'
+                    ? overviewStatsRef.current
+                    : existingCache?.overviewStats ?? overviewStatsRef.current)
+            await configService.setSnsPageCache(scopeKey, {
+                overviewStats: overviewToStore,
+                posts: postsToStore.slice(0, SNS_PAGE_CACHE_POST_LIMIT)
+            })
+        } catch (error) {
+            console.error('Failed to persist SNS page cache:', error)
+        }
+    }, [ensureSnsCacheScopeKey, isDefaultViewNow])
+
+    const hydrateSnsPageCache = useCallback(async () => {
+        try {
+            const scopeKey = await ensureSnsCacheScopeKey()
+            const cached = await configService.getSnsPageCache(scopeKey)
+            if (!cached) return
+            if (Date.now() - cached.updatedAt > SNS_PAGE_CACHE_TTL_MS) return
+
+            const cachedOverview = cached.overviewStats
+            if (cachedOverview) {
+                const cachedTotalPosts = Math.max(0, Number(cachedOverview.totalPosts || 0))
+                const cachedTotalFriends = Math.max(0, Number(cachedOverview.totalFriends || 0))
+                const hasCachedPosts = Array.isArray(cached.posts) && cached.posts.length > 0
+                const hasOverviewData = cachedTotalPosts > 0 || cachedTotalFriends > 0
+                setOverviewStats({
+                    totalPosts: cachedTotalPosts,
+                    totalFriends: cachedTotalFriends,
+                    myPosts: typeof cachedOverview.myPosts === 'number' && Number.isFinite(cachedOverview.myPosts) && cachedOverview.myPosts >= 0
+                        ? Math.floor(cachedOverview.myPosts)
+                        : null,
+                    earliestTime: cachedOverview.earliestTime ?? null,
+                    latestTime: cachedOverview.latestTime ?? null
+                })
+                // 只有明确有统计值（或确实无帖子）时才把缓存视为 ready，避免历史异常 0 卡住显示。
+                setOverviewStatsStatus(hasOverviewData || !hasCachedPosts ? 'ready' : 'loading')
+            }
+
+            if (Array.isArray(cached.posts) && cached.posts.length > 0) {
+                const cachedPosts = cached.posts
+                    .filter((raw): raw is SnsPost => {
+                        if (!raw || typeof raw !== 'object') return false
+                        const row = raw as Record<string, unknown>
+                        return typeof row.id === 'string' && typeof row.createTime === 'number'
+                    })
+                    .slice(0, SNS_PAGE_CACHE_POST_LIMIT)
+                    .sort((a, b) => b.createTime - a.createTime)
+
+                if (cachedPosts.length > 0) {
+                    setPosts(cachedPosts)
+                    setHasMore(true)
+                    setHasNewer(false)
+                }
+            }
+        } catch (error) {
+            console.error('Failed to hydrate SNS page cache:', error)
+        }
+    }, [ensureSnsCacheScopeKey])
+
+    const loadOverviewStats = useCallback(async () => {
+        setOverviewStatsStatus('loading')
+        try {
+            const statsResult = await window.electronAPI.sns.getExportStats()
+            if (!statsResult.success || !statsResult.data) {
+                throw new Error(statsResult.error || '获取朋友圈统计失败')
+            }
+
+            const totalPosts = Math.max(0, Number(statsResult.data.totalPosts || 0))
+            const totalFriends = Math.max(0, Number(statsResult.data.totalFriends || 0))
+            const myPosts = (typeof statsResult.data.myPosts === 'number' && Number.isFinite(statsResult.data.myPosts) && statsResult.data.myPosts >= 0)
+                ? Math.floor(statsResult.data.myPosts)
+                : null
+            let earliestTime: number | null = null
+            let latestTime: number | null = null
+
+            if (totalPosts > 0) {
+                const [latestResult, earliestResult] = await Promise.all([
+                    window.electronAPI.sns.getTimeline(1, 0),
+                    window.electronAPI.sns.getTimeline(1, Math.max(totalPosts - 1, 0))
+                ])
+                const latestTs = Number(latestResult.timeline?.[0]?.createTime || 0)
+                const earliestTs = Number(earliestResult.timeline?.[0]?.createTime || 0)
+
+                if (latestResult.success && Number.isFinite(latestTs) && latestTs > 0) {
+                    latestTime = Math.floor(latestTs)
+                }
+                if (earliestResult.success && Number.isFinite(earliestTs) && earliestTs > 0) {
+                    earliestTime = Math.floor(earliestTs)
+                }
+            }
+
+            const nextOverviewStats = {
+                totalPosts,
+                totalFriends,
+                myPosts,
+                earliestTime,
+                latestTime
+            }
+            setOverviewStats(nextOverviewStats)
+            setOverviewStatsStatus('ready')
+            void persistSnsPageCache({ overviewStats: nextOverviewStats })
+        } catch (error) {
+            console.error('Failed to load SNS overview stats:', error)
+            setOverviewStatsStatus('error')
+        }
+    }, [persistSnsPageCache])
+
+    const renderOverviewStats = () => {
+        if (overviewStatsStatus === 'error') {
+            return (
+                <button type="button" className="feed-stats-retry" onClick={() => { void loadOverviewStats() }}>
+                    统计失败，点击重试
+                </button>
+            )
+        }
+        if (overviewStatsStatus === 'loading') {
+            return '统计中...'
+        }
+        const myPostsLabel = overviewStats.myPosts === null ? '--' : String(overviewStats.myPosts)
+        return `共 ${overviewStats.totalPosts} 条 ｜ 我的朋友圈 ${myPostsLabel} 条 ｜ ${formatDateOnly(overviewStats.earliestTime)} ~ ${formatDateOnly(overviewStats.latestTime)} ｜ ${overviewStats.totalFriends} 位好友`
+    }
 
     const loadPosts = useCallback(async (options: { reset?: boolean, direction?: 'older' | 'newer' } = {}) => {
         const { reset = false, direction = 'older' } = options
@@ -119,7 +323,9 @@ export default function SnsPage() {
                         const uniqueNewer = result.timeline.filter((p: SnsPost) => !existingIds.has(p.id));
 
                         if (uniqueNewer.length > 0) {
-                            setPosts(prev => [...uniqueNewer, ...prev].sort((a, b) => b.createTime - a.createTime));
+                            const merged = [...uniqueNewer, ...currentPosts].sort((a, b) => b.createTime - a.createTime)
+                            setPosts(merged);
+                            void persistSnsPageCache({ posts: merged })
                         }
                         setHasNewer(result.timeline.length >= limit);
                     } else {
@@ -149,6 +355,7 @@ export default function SnsPage() {
             if (result.success && result.timeline) {
                 if (reset) {
                     setPosts(result.timeline)
+                    void persistSnsPageCache({ posts: result.timeline })
                     setHasMore(result.timeline.length >= limit)
 
                     // Check for newer items above topTs
@@ -165,7 +372,9 @@ export default function SnsPage() {
                     }
                 } else {
                     if (result.timeline.length > 0) {
-                        setPosts(prev => [...prev, ...result.timeline!].sort((a, b) => b.createTime - a.createTime))
+                        const merged = [...postsRef.current, ...result.timeline!].sort((a, b) => b.createTime - a.createTime)
+                        setPosts(merged)
+                        void persistSnsPageCache({ posts: merged })
                     }
                     if (result.timeline.length < limit) {
                         setHasMore(false)
@@ -179,22 +388,16 @@ export default function SnsPage() {
             setLoadingNewer(false)
             loadingRef.current = false
         }
-    }, [selectedUsernames, searchKeyword, jumpTargetDate])
+    }, [jumpTargetDate, persistSnsPageCache, searchKeyword, selectedUsernames])
 
-    // Load Contacts（合并好友+曾经好友+朋友圈发布者，enrichSessionsContactInfo 补充头像）
+    // Load Contacts（仅加载好友/曾经好友，不再统计朋友圈条数）
     const loadContacts = useCallback(async () => {
+        const requestToken = ++contactsLoadTokenRef.current
         setContactsLoading(true)
         try {
-            // 并行获取联系人列表和朋友圈发布者列表
-            const [contactsResult, snsResult] = await Promise.all([
-                window.electronAPI.chat.getContacts(),
-                window.electronAPI.sns.getSnsUsernames()
-            ])
-
-            // 以联系人为基础，按 username 去重
+            const contactsResult = await window.electronAPI.chat.getContacts()
             const contactMap = new Map<string, Contact>()
 
-            // 好友和曾经的好友
             if (contactsResult.success && contactsResult.contacts) {
                 for (const c of contactsResult.contacts) {
                     if (c.type === 'friend' || c.type === 'former_friend') {
@@ -208,55 +411,61 @@ export default function SnsPage() {
                 }
             }
 
-            // 朋友圈发布者（补充不在联系人列表中的用户）
-            if (snsResult.success && snsResult.usernames) {
-                for (const u of snsResult.usernames) {
-                    if (!contactMap.has(u)) {
-                        contactMap.set(u, { username: u, displayName: u, type: 'sns_only' })
-                    }
-                }
-            }
+            let contactsList = Array.from(contactMap.values())
 
-            const allUsernames = Array.from(contactMap.keys())
+            if (requestToken !== contactsLoadTokenRef.current) return
+            setContacts(contactsList)
+
+            const allUsernames = contactsList.map(c => c.username)
 
             // 用 enrichSessionsContactInfo 统一补充头像和显示名
             if (allUsernames.length > 0) {
                 const enriched = await window.electronAPI.chat.enrichSessionsContactInfo(allUsernames)
                 if (enriched.success && enriched.contacts) {
-                    for (const [username, extra] of Object.entries(enriched.contacts) as [string, { displayName?: string; avatarUrl?: string }][]) {
-                        const c = contactMap.get(username)
-                        if (c) {
-                            c.displayName = extra.displayName || c.displayName
-                            c.avatarUrl = extra.avatarUrl || c.avatarUrl
+                    contactsList = contactsList.map(contact => {
+                        const extra = enriched.contacts?.[contact.username]
+                        if (!extra) return contact
+                        return {
+                            ...contact,
+                            displayName: extra.displayName || contact.displayName,
+                            avatarUrl: extra.avatarUrl || contact.avatarUrl
                         }
-                    }
+                    })
+                    if (requestToken !== contactsLoadTokenRef.current) return
+                    setContacts(contactsList)
                 }
             }
-
-            setContacts(Array.from(contactMap.values()))
         } catch (error) {
+            if (requestToken !== contactsLoadTokenRef.current) return
             console.error('Failed to load contacts:', error)
         } finally {
-            setContactsLoading(false)
+            if (requestToken === contactsLoadTokenRef.current) {
+                setContactsLoading(false)
+            }
         }
     }, [])
 
     // Initial Load & Listeners
     useEffect(() => {
+        void hydrateSnsPageCache()
         loadContacts()
-    }, [loadContacts])
+        loadOverviewStats()
+    }, [hydrateSnsPageCache, loadContacts, loadOverviewStats])
 
     useEffect(() => {
         const handleChange = () => {
+            cacheScopeKeyRef.current = ''
             // wxid changed, reset everything
             setPosts([]); setHasMore(true); setHasNewer(false);
             setSelectedUsernames([]); setSearchKeyword(''); setJumpTargetDate(undefined);
+            void hydrateSnsPageCache()
             loadContacts();
+            loadOverviewStats();
             loadPosts({ reset: true });
         }
         window.addEventListener('wxid-changed', handleChange as EventListener)
         return () => window.removeEventListener('wxid-changed', handleChange as EventListener)
-    }, [loadContacts, loadPosts])
+    }, [hydrateSnsPageCache, loadContacts, loadOverviewStats, loadPosts])
 
     useEffect(() => {
         const timer = setTimeout(() => {
@@ -285,10 +494,15 @@ export default function SnsPage() {
 
     return (
         <div className="sns-page-layout">
-            <div className="sns-main-viewport" onScroll={handleScroll} onWheel={handleWheel} ref={postsContainerRef}>
+            <div className="sns-main-viewport">
                 <div className="sns-feed-container">
                     <div className="feed-header">
-                        <h2>朋友圈</h2>
+                        <div className="feed-header-main">
+                            <h2>朋友圈</h2>
+                            <div className={`feed-stats-line ${overviewStatsStatus}`}>
+                                {renderOverviewStats()}
+                            </div>
+                        </div>
                         <div className="header-actions">
                             <button
                                 onClick={async () => {
@@ -325,6 +539,7 @@ export default function SnsPage() {
                                 onClick={() => {
                                     setRefreshSpin(true)
                                     loadPosts({ reset: true })
+                                    loadOverviewStats()
                                     setTimeout(() => setRefreshSpin(false), 800)
                                 }}
                                 disabled={loading || loadingNewer}
@@ -336,75 +551,84 @@ export default function SnsPage() {
                         </div>
                     </div>
 
-                    {loadingNewer && (
-                        <div className="status-indicator loading-newer">
-                            <RefreshCw size={16} className="spinning" />
-                            <span>正在检查更新的动态...</span>
-                        </div>
-                    )}
-
-                    {!loadingNewer && hasNewer && (
-                        <div className="status-indicator newer-hint" onClick={() => loadPosts({ direction: 'newer' })}>
-                            有新动态，点击查看
-                        </div>
-                    )}
-
-                    <div className="posts-list">
-                        {posts.map(post => (
-                            <SnsPostItem
-                                key={post.id}
-                                post={{ ...post, isProtected: triggerInstalled === true }}
-                                onPreview={(src, isVideo, liveVideoPath) => {
-                                    if (isVideo) {
-                                        void window.electronAPI.window.openVideoPlayerWindow(src)
-                                    } else {
-                                        void window.electronAPI.window.openImageViewerWindow(src, liveVideoPath || undefined)
-                                    }
-                                }}
-                                onDebug={(p) => setDebugPost(p)}
-                                onDelete={(postId) => setPosts(prev => prev.filter(p => p.id !== postId))}
-                            />
-                        ))}
-                    </div>
-
-                    {loading && posts.length === 0 && (
-                        <div className="initial-loading">
-                            <div className="loading-pulse">
-                                <div className="pulse-circle"></div>
-                                <span>正在加载朋友圈...</span>
+                    <div className="sns-posts-scroll" onScroll={handleScroll} onWheel={handleWheel} ref={postsContainerRef}>
+                        {loadingNewer && (
+                            <div className="status-indicator loading-newer">
+                                <RefreshCw size={16} className="spinning" />
+                                <span>正在检查更新的动态...</span>
                             </div>
-                        </div>
-                    )}
+                        )}
 
-                    {loading && posts.length > 0 && (
-                        <div className="status-indicator loading-more">
-                            <RefreshCw size={16} className="spinning" />
-                            <span>正在加载更多...</span>
-                        </div>
-                    )}
+                        {!loadingNewer && hasNewer && (
+                            <div className="status-indicator newer-hint" onClick={() => loadPosts({ direction: 'newer' })}>
+                                有新动态，点击查看
+                            </div>
+                        )}
 
-                    {!hasMore && posts.length > 0 && (
-                        <div className="status-indicator no-more">{
-                            selectedUsernames.length === 1 &&
-                            contacts.find(c => c.username === selectedUsernames[0])?.type === 'former_friend'
-                                ? '在时间的长河里刻舟求剑'
-                                : '或许过往已无可溯洄，但好在还有可以与你相遇的明天'
-                        }</div>
-                    )}
-
-                    {!loading && posts.length === 0 && (
-                        <div className="no-results">
-                            <div className="no-results-icon"><Search size={48} /></div>
-                            <p>未找到相关动态</p>
-                            {(selectedUsernames.length > 0 || searchKeyword || jumpTargetDate) && (
-                                <button onClick={() => {
-                                    setSearchKeyword(''); setSelectedUsernames([]); setJumpTargetDate(undefined);
-                                }} className="reset-inline">
-                                    重置筛选条件
-                                </button>
-                            )}
+                        <div className="posts-list">
+                            {posts.map(post => (
+                                <SnsPostItem
+                                    key={post.id}
+                                    post={{ ...post, isProtected: triggerInstalled === true }}
+                                    onPreview={(src, isVideo, liveVideoPath) => {
+                                        if (isVideo) {
+                                            void window.electronAPI.window.openVideoPlayerWindow(src)
+                                        } else {
+                                            void window.electronAPI.window.openImageViewerWindow(src, liveVideoPath || undefined)
+                                        }
+                                    }}
+                                    onDebug={(p) => setDebugPost(p)}
+                                    onDelete={(postId) => {
+                                        setPosts(prev => {
+                                            const next = prev.filter(p => p.id !== postId)
+                                            void persistSnsPageCache({ posts: next })
+                                            return next
+                                        })
+                                        loadOverviewStats()
+                                    }}
+                                />
+                            ))}
                         </div>
-                    )}
+
+                        {loading && posts.length === 0 && (
+                            <div className="initial-loading">
+                                <div className="loading-pulse">
+                                    <div className="pulse-circle"></div>
+                                    <span>正在加载朋友圈...</span>
+                                </div>
+                            </div>
+                        )}
+
+                        {loading && posts.length > 0 && (
+                            <div className="status-indicator loading-more">
+                                <RefreshCw size={16} className="spinning" />
+                                <span>正在加载更多...</span>
+                            </div>
+                        )}
+
+                        {!hasMore && posts.length > 0 && (
+                            <div className="status-indicator no-more">{
+                                selectedUsernames.length === 1 &&
+                                contacts.find(c => c.username === selectedUsernames[0])?.type === 'former_friend'
+                                    ? '在时间的长河里刻舟求剑'
+                                    : '或许过往已无可溯洄，但好在还有可以与你相遇的明天'
+                            }</div>
+                        )}
+
+                        {!loading && posts.length === 0 && (
+                            <div className="no-results">
+                                <div className="no-results-icon"><Search size={48} /></div>
+                                <p>未找到相关动态</p>
+                                {(selectedUsernames.length > 0 || searchKeyword || jumpTargetDate) && (
+                                    <button onClick={() => {
+                                        setSearchKeyword(''); setSelectedUsernames([]); setJumpTargetDate(undefined);
+                                    }} className="reset-inline">
+                                        重置筛选条件
+                                    </button>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 </div>
             </div>
 
@@ -597,6 +821,15 @@ export default function SnsPage() {
                                                 <span>JSON</span>
                                                 <small>结构化数据</small>
                                             </button>
+                                            <button
+                                                className={`format-option ${exportFormat === 'arkmejson' ? 'active' : ''}`}
+                                                onClick={() => setExportFormat('arkmejson')}
+                                                disabled={isExporting}
+                                            >
+                                                <FileJson size={20} />
+                                                <span>ArkmeJSON</span>
+                                                <small>结构化数据（含互动身份）</small>
+                                            </button>
                                         </div>
                                     </div>
 
@@ -658,22 +891,40 @@ export default function SnsPage() {
 
                                     {/* 媒体导出 */}
                                     <div className="export-section">
-                                        <div className="export-toggle-row">
-                                            <div className="toggle-label">
-                                                <Image size={16} />
-                                                <span>导出媒体文件（图片/视频）</span>
-                                            </div>
-                                            <button
-                                                className={`toggle-switch${exportMedia ? ' active' : ''}`}
-                                                onClick={() => !isExporting && setExportMedia(!exportMedia)}
-                                                disabled={isExporting}
-                                            >
-                                                <span className="toggle-knob" />
-                                            </button>
+                                        <label className="export-label">
+                                            <Image size={14} />
+                                            媒体文件（可多选）
+                                        </label>
+                                        <div className="export-media-check-grid">
+                                            <label>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={exportImages}
+                                                    onChange={(e) => setExportImages(e.target.checked)}
+                                                    disabled={isExporting}
+                                                />
+                                                图片
+                                            </label>
+                                            <label>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={exportLivePhotos}
+                                                    onChange={(e) => setExportLivePhotos(e.target.checked)}
+                                                    disabled={isExporting}
+                                                />
+                                                实况图
+                                            </label>
+                                            <label>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={exportVideos}
+                                                    onChange={(e) => setExportVideos(e.target.checked)}
+                                                    disabled={isExporting}
+                                                />
+                                                视频
+                                            </label>
                                         </div>
-                                        {exportMedia && (
-                                            <p className="export-media-hint">媒体文件将保存到输出目录的 media 子目录中，可能需要较长时间</p>
-                                        )}
+                                        <p className="export-media-hint">全不勾选时仅导出文本信息，不导出媒体文件</p>
                                     </div>
 
                                     {/* 同步提示 */}
@@ -723,7 +974,9 @@ export default function SnsPage() {
                                                         format: exportFormat,
                                                         usernames: selectedUsernames.length > 0 ? selectedUsernames : undefined,
                                                         keyword: searchKeyword || undefined,
-                                                        exportMedia,
+                                                        exportImages,
+                                                        exportLivePhotos,
+                                                        exportVideos,
                                                         startTime: exportDateRange.start ? Math.floor(new Date(exportDateRange.start).getTime() / 1000) : undefined,
                                                         endTime: exportDateRange.end ? Math.floor(new Date(exportDateRange.end + 'T23:59:59').getTime() / 1000) : undefined
                                                     })

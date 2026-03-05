@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed } from 'lucide-react'
+import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { useChatStore } from '../stores/chatStore'
@@ -10,8 +10,14 @@ import { getEmojiPath } from 'wechat-emojis'
 import { VoiceTranscribeDialog } from '../components/VoiceTranscribeDialog'
 import { LivePhotoIcon } from '../components/LivePhotoIcon'
 import { AnimatedStreamingText } from '../components/AnimatedStreamingText'
-import JumpToDateDialog from '../components/JumpToDateDialog'
+import JumpToDatePopover from '../components/JumpToDatePopover'
 import * as configService from '../services/config'
+import {
+  emitOpenSingleExport,
+  onExportSessionStatus,
+  onSingleExportDialogStatus,
+  requestExportSessionStatus
+} from '../services/exportBridge'
 import './ChatPage.scss'
 
 // 系统消息类型常量
@@ -142,8 +148,62 @@ function cleanMessageContent(content: string): string {
   return content.trim()
 }
 
+const CHAT_SESSION_LIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const CHAT_SESSION_PREVIEW_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const CHAT_SESSION_PREVIEW_LIMIT_PER_SESSION = 30
+const CHAT_SESSION_PREVIEW_MAX_SESSIONS = 18
+const CHAT_SESSION_WINDOW_CACHE_TTL_MS = 12 * 60 * 60 * 1000
+const CHAT_SESSION_WINDOW_CACHE_MAX_SESSIONS = 30
+const CHAT_SESSION_WINDOW_CACHE_MAX_MESSAGES = 300
+const GROUP_MEMBERS_PANEL_CACHE_TTL_MS = 10 * 60 * 1000
+
+function buildChatSessionListCacheKey(scope: string): string {
+  return `weflow.chat.sessions.v1::${scope || 'default'}`
+}
+
+function buildChatSessionPreviewCacheKey(scope: string): string {
+  return `weflow.chat.preview.v1::${scope || 'default'}`
+}
+
+function normalizeChatCacheScope(dbPath: unknown, wxid: unknown): string {
+  const db = String(dbPath || '').trim()
+  const id = String(wxid || '').trim()
+  if (!db && !id) return 'default'
+  return `${db}::${id}`
+}
+
+function safeParseJson<T>(raw: string | null): T | null {
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return null
+  }
+}
+
+function formatYmdDateFromSeconds(timestamp?: number): string {
+  if (!timestamp || !Number.isFinite(timestamp)) return '—'
+  const d = new Date(timestamp * 1000)
+  const y = d.getFullYear()
+  const m = `${d.getMonth() + 1}`.padStart(2, '0')
+  const day = `${d.getDate()}`.padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function formatYmdHmDateTime(timestamp?: number): string {
+  if (!timestamp || !Number.isFinite(timestamp)) return '—'
+  const d = new Date(timestamp)
+  const y = d.getFullYear()
+  const m = `${d.getMonth() + 1}`.padStart(2, '0')
+  const day = `${d.getDate()}`.padStart(2, '0')
+  const h = `${d.getHours()}`.padStart(2, '0')
+  const min = `${d.getMinutes()}`.padStart(2, '0')
+  return `${y}-${m}-${day} ${h}:${min}`
+}
+
 interface ChatPageProps {
-  // 保留接口以备将来扩展
+  standaloneSessionWindow?: boolean
+  initialSessionId?: string | null
 }
 
 
@@ -155,9 +215,103 @@ interface SessionDetail {
   alias?: string
   avatarUrl?: string
   messageCount: number
+  voiceMessages?: number
+  imageMessages?: number
+  videoMessages?: number
+  emojiMessages?: number
+  transferMessages?: number
+  redPacketMessages?: number
+  callMessages?: number
+  privateMutualGroups?: number
+  groupMemberCount?: number
+  groupMyMessages?: number
+  groupActiveSpeakers?: number
+  groupMutualFriends?: number
+  relationStatsLoaded?: boolean
+  statsUpdatedAt?: number
+  statsStale?: boolean
   firstMessageTime?: number
   latestMessageTime?: number
   messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+interface SessionExportMetric {
+  totalMessages: number
+  voiceMessages: number
+  imageMessages: number
+  videoMessages: number
+  emojiMessages: number
+  transferMessages: number
+  redPacketMessages: number
+  callMessages: number
+  firstTimestamp?: number
+  lastTimestamp?: number
+  privateMutualGroups?: number
+  groupMemberCount?: number
+  groupMyMessages?: number
+  groupActiveSpeakers?: number
+  groupMutualFriends?: number
+}
+
+interface SessionExportCacheMeta {
+  updatedAt: number
+  stale: boolean
+  includeRelations: boolean
+  source: 'memory' | 'disk' | 'fresh'
+}
+
+type GroupMessageCountStatus = 'loading' | 'ready' | 'failed'
+
+interface GroupPanelMember {
+  username: string
+  displayName: string
+  avatarUrl?: string
+  nickname?: string
+  alias?: string
+  remark?: string
+  groupNickname?: string
+  isOwner?: boolean
+  isFriend: boolean
+  messageCount: number
+  messageCountStatus: GroupMessageCountStatus
+}
+
+interface SessionListCachePayload {
+  updatedAt: number
+  sessions: ChatSession[]
+}
+
+interface SessionPreviewCacheEntry {
+  updatedAt: number
+  messages: Message[]
+}
+
+interface SessionPreviewCachePayload {
+  updatedAt: number
+  entries: Record<string, SessionPreviewCacheEntry>
+}
+
+interface GroupMembersPanelCacheEntry {
+  updatedAt: number
+  members: GroupPanelMember[]
+  includeMessageCounts: boolean
+}
+
+interface SessionWindowCacheEntry {
+  updatedAt: number
+  messages: Message[]
+  currentOffset: number
+  hasMoreMessages: boolean
+  hasMoreLater: boolean
+  jumpStartTime: number
+  jumpEndTime: number
+}
+
+interface LoadMessagesOptions {
+  preferLatestPath?: boolean
+  deferGroupSenderWarmup?: boolean
+  forceInitialLimit?: number
+  switchRequestSeq?: number
 }
 
 // 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
@@ -253,7 +407,9 @@ const SessionItem = React.memo(function SessionItem({
 
 
 
-function ChatPage(_props: ChatPageProps) {
+function ChatPage(props: ChatPageProps) {
+  const { standaloneSessionWindow = false, initialSessionId = null } = props
+  const normalizedInitialSessionId = useMemo(() => String(initialSessionId || '').trim(), [initialSessionId])
   const navigate = useNavigate()
 
   const {
@@ -296,31 +452,53 @@ function ChatPage(_props: ChatPageProps) {
   }, [])
   const initialRevealTimerRef = useRef<number | null>(null)
   const sessionListRef = useRef<HTMLDivElement>(null)
+  const jumpCalendarWrapRef = useRef<HTMLDivElement>(null)
+  const jumpPopoverPortalRef = useRef<HTMLDivElement>(null)
   const [currentOffset, setCurrentOffset] = useState(0)
   const [jumpStartTime, setJumpStartTime] = useState(0)
   const [jumpEndTime, setJumpEndTime] = useState(0)
-  const [showJumpDialog, setShowJumpDialog] = useState(false)
+  const [showJumpPopover, setShowJumpPopover] = useState(false)
+  const [jumpPopoverDate, setJumpPopoverDate] = useState<Date>(new Date())
+  const [jumpPopoverPosition, setJumpPopoverPosition] = useState<{ top: number; left: number }>({ top: 0, left: 0 })
   const isDateJumpRef = useRef(false)
   const [messageDates, setMessageDates] = useState<Set<string>>(new Set())
+  const [hasLoadedMessageDates, setHasLoadedMessageDates] = useState(false)
   const [loadingDates, setLoadingDates] = useState(false)
   const messageDatesCache = useRef<Map<string, Set<string>>>(new Map())
+  const [messageDateCounts, setMessageDateCounts] = useState<Record<string, number>>({})
+  const [loadingDateCounts, setLoadingDateCounts] = useState(false)
+  const messageDateCountsCache = useRef<Map<string, Record<string, number>>>(new Map())
   const [myAvatarUrl, setMyAvatarUrl] = useState<string | undefined>(undefined)
   const [myWxid, setMyWxid] = useState<string | undefined>(undefined)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(260)
   const [isResizing, setIsResizing] = useState(false)
   const [showDetailPanel, setShowDetailPanel] = useState(false)
+  const [showGroupMembersPanel, setShowGroupMembersPanel] = useState(false)
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [isLoadingDetail, setIsLoadingDetail] = useState(false)
+  const [isLoadingDetailExtra, setIsLoadingDetailExtra] = useState(false)
+  const [isRefreshingDetailStats, setIsRefreshingDetailStats] = useState(false)
+  const [isLoadingRelationStats, setIsLoadingRelationStats] = useState(false)
+  const [groupPanelMembers, setGroupPanelMembers] = useState<GroupPanelMember[]>([])
+  const [isLoadingGroupMembers, setIsLoadingGroupMembers] = useState(false)
+  const [groupMembersError, setGroupMembersError] = useState<string | null>(null)
+  const [groupMembersLoadingHint, setGroupMembersLoadingHint] = useState('')
+  const [isRefreshingGroupMembers, setIsRefreshingGroupMembers] = useState(false)
+  const [groupMemberSearchKeyword, setGroupMemberSearchKeyword] = useState('')
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
   const [foldedView, setFoldedView] = useState(false) // 是否在"折叠的群聊"视图
   const [hasInitialMessages, setHasInitialMessages] = useState(false)
+  const [isSessionSwitching, setIsSessionSwitching] = useState(false)
   const [noMessageTable, setNoMessageTable] = useState(false)
   const [fallbackDisplayName, setFallbackDisplayName] = useState<string | null>(null)
   const [showVoiceTranscribeDialog, setShowVoiceTranscribeDialog] = useState(false)
   const [pendingVoiceTranscriptRequest, setPendingVoiceTranscriptRequest] = useState<{ sessionId: string; messageId: string } | null>(null)
+  const [inProgressExportSessionIds, setInProgressExportSessionIds] = useState<Set<string>>(new Set())
+  const [isPreparingExportDialog, setIsPreparingExportDialog] = useState(false)
+  const [exportPrepareHint, setExportPrepareHint] = useState('')
 
   // 消息右键菜单
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: Message } | null>(null)
@@ -376,6 +554,9 @@ function ChatPage(_props: ChatPageProps) {
   const sessionMapRef = useRef<Map<string, ChatSession>>(new Map())
   const sessionsRef = useRef<ChatSession[]>([])
   const currentSessionRef = useRef<string | null>(null)
+  const pendingSessionLoadRef = useRef<string | null>(null)
+  const sessionSwitchRequestSeqRef = useRef(0)
+  const initialLoadRequestedSessionRef = useRef<string | null>(null)
   const prevSessionRef = useRef<string | null>(null)
   const isLoadingMessagesRef = useRef(false)
   const isLoadingMoreRef = useRef(false)
@@ -384,6 +565,215 @@ function ChatPage(_props: ChatPageProps) {
   const searchKeywordRef = useRef('')
   const preloadImageKeysRef = useRef<Set<string>>(new Set())
   const lastPreloadSessionRef = useRef<string | null>(null)
+  const detailRequestSeqRef = useRef(0)
+  const groupMembersRequestSeqRef = useRef(0)
+  const groupMembersPanelCacheRef = useRef<Map<string, GroupMembersPanelCacheEntry>>(new Map())
+  const hasInitializedGroupMembersRef = useRef(false)
+  const chatCacheScopeRef = useRef('default')
+  const previewCacheRef = useRef<Record<string, SessionPreviewCacheEntry>>({})
+  const sessionWindowCacheRef = useRef<Map<string, SessionWindowCacheEntry>>(new Map())
+  const previewPersistTimerRef = useRef<number | null>(null)
+  const sessionListPersistTimerRef = useRef<number | null>(null)
+  const pendingExportRequestIdRef = useRef<string | null>(null)
+  const exportPrepareLongWaitTimerRef = useRef<number | null>(null)
+  const jumpDatesRequestSeqRef = useRef(0)
+  const jumpDateCountsRequestSeqRef = useRef(0)
+
+  const isGroupChatSession = useCallback((username: string) => {
+    return username.includes('@chatroom')
+  }, [])
+
+  const clearExportPrepareState = useCallback(() => {
+    pendingExportRequestIdRef.current = null
+    setIsPreparingExportDialog(false)
+    setExportPrepareHint('')
+    if (exportPrepareLongWaitTimerRef.current) {
+      window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+      exportPrepareLongWaitTimerRef.current = null
+    }
+  }, [])
+
+  const resolveCurrentViewDate = useCallback(() => {
+    if (jumpStartTime > 0) {
+      return new Date(jumpStartTime * 1000)
+    }
+    const fallbackMessage = messages[messages.length - 1] || messages[0]
+    const rawTimestamp = Number(fallbackMessage?.createTime || 0)
+    if (Number.isFinite(rawTimestamp) && rawTimestamp > 0) {
+      return new Date(rawTimestamp > 10000000000 ? rawTimestamp : rawTimestamp * 1000)
+    }
+    return new Date()
+  }, [jumpStartTime, messages])
+
+  const loadJumpCalendarData = useCallback(async (sessionId: string) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return
+
+    const cachedDates = messageDatesCache.current.get(normalizedSessionId)
+    if (cachedDates) {
+      setMessageDates(new Set(cachedDates))
+      setHasLoadedMessageDates(true)
+      setLoadingDates(false)
+    } else {
+      setLoadingDates(true)
+      setHasLoadedMessageDates(false)
+      setMessageDates(new Set())
+      const requestSeq = jumpDatesRequestSeqRef.current + 1
+      jumpDatesRequestSeqRef.current = requestSeq
+      try {
+        const result = await window.electronAPI.chat.getMessageDates(normalizedSessionId)
+        if (requestSeq !== jumpDatesRequestSeqRef.current || currentSessionRef.current !== normalizedSessionId) return
+        if (result?.success && Array.isArray(result.dates)) {
+          const dateSet = new Set<string>(result.dates)
+          messageDatesCache.current.set(normalizedSessionId, dateSet)
+          setMessageDates(new Set(dateSet))
+          setHasLoadedMessageDates(true)
+        }
+      } catch (error) {
+        console.error('获取消息日期失败:', error)
+      } finally {
+        if (requestSeq === jumpDatesRequestSeqRef.current && currentSessionRef.current === normalizedSessionId) {
+          setLoadingDates(false)
+        }
+      }
+    }
+
+    const cachedCounts = messageDateCountsCache.current.get(normalizedSessionId)
+    if (cachedCounts) {
+      setMessageDateCounts({ ...cachedCounts })
+      setLoadingDateCounts(false)
+      return
+    }
+
+    setLoadingDateCounts(true)
+    setMessageDateCounts({})
+    const requestSeq = jumpDateCountsRequestSeqRef.current + 1
+    jumpDateCountsRequestSeqRef.current = requestSeq
+    try {
+      const result = await window.electronAPI.chat.getMessageDateCounts(normalizedSessionId)
+      if (requestSeq !== jumpDateCountsRequestSeqRef.current || currentSessionRef.current !== normalizedSessionId) return
+      if (result?.success && result.counts) {
+        const normalizedCounts: Record<string, number> = {}
+        Object.entries(result.counts).forEach(([date, value]) => {
+          const count = Number(value)
+          if (!date || !Number.isFinite(count) || count <= 0) return
+          normalizedCounts[date] = count
+        })
+        messageDateCountsCache.current.set(normalizedSessionId, normalizedCounts)
+        setMessageDateCounts(normalizedCounts)
+      }
+    } catch (error) {
+      console.error('获取每日消息数失败:', error)
+    } finally {
+      if (requestSeq === jumpDateCountsRequestSeqRef.current && currentSessionRef.current === normalizedSessionId) {
+        setLoadingDateCounts(false)
+      }
+    }
+  }, [])
+
+  const updateJumpPopoverPosition = useCallback(() => {
+    const anchor = jumpCalendarWrapRef.current
+    if (!anchor) return
+
+    const popoverWidth = 312
+    const viewportGap = 8
+    const anchorRect = anchor.getBoundingClientRect()
+
+    let left = anchorRect.right - popoverWidth
+    left = Math.max(viewportGap, Math.min(left, window.innerWidth - popoverWidth - viewportGap))
+
+    const portalHeight = jumpPopoverPortalRef.current?.offsetHeight || 0
+    const belowTop = anchorRect.bottom + 10
+    let top = belowTop
+    if (portalHeight > 0 && belowTop + portalHeight > window.innerHeight - viewportGap) {
+      top = Math.max(viewportGap, anchorRect.top - portalHeight - 10)
+    }
+
+    setJumpPopoverPosition(prev => {
+      if (prev.top === top && prev.left === left) return prev
+      return { top, left }
+    })
+  }, [])
+
+  const handleToggleJumpPopover = useCallback(() => {
+    if (!currentSessionId) return
+    if (showJumpPopover) {
+      setShowJumpPopover(false)
+      return
+    }
+    setJumpPopoverDate(resolveCurrentViewDate())
+    updateJumpPopoverPosition()
+    setShowJumpPopover(true)
+    requestAnimationFrame(() => updateJumpPopoverPosition())
+    void loadJumpCalendarData(currentSessionId)
+  }, [currentSessionId, loadJumpCalendarData, resolveCurrentViewDate, showJumpPopover, updateJumpPopoverPosition])
+
+  useEffect(() => {
+    const unsubscribe = onExportSessionStatus((payload) => {
+      const ids = Array.isArray(payload?.inProgressSessionIds)
+        ? payload.inProgressSessionIds
+          .filter((id): id is string => typeof id === 'string')
+          .map(id => id.trim())
+          .filter(Boolean)
+        : []
+      setInProgressExportSessionIds(new Set(ids))
+    })
+
+    requestExportSessionStatus()
+    const timer = window.setTimeout(() => {
+      requestExportSessionStatus()
+    }, 0)
+    return () => {
+      window.clearTimeout(timer)
+      unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = onSingleExportDialogStatus((payload) => {
+      const requestId = typeof payload?.requestId === 'string' ? payload.requestId.trim() : ''
+      if (!requestId || requestId !== pendingExportRequestIdRef.current) return
+
+      if (payload.status === 'initializing') {
+        setExportPrepareHint('正在准备导出模块（首次会稍慢，通常 1-3 秒）')
+        if (exportPrepareLongWaitTimerRef.current) {
+          window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+        }
+        exportPrepareLongWaitTimerRef.current = window.setTimeout(() => {
+          if (pendingExportRequestIdRef.current !== requestId) return
+          setExportPrepareHint('仍在准备导出模块，请稍候...')
+        }, 8000)
+        return
+      }
+
+      if (payload.status === 'opened') {
+        clearExportPrepareState()
+        return
+      }
+
+      if (payload.status === 'failed') {
+        const message = (typeof payload.message === 'string' && payload.message.trim())
+          ? payload.message.trim()
+          : '导出模块初始化失败，请重试'
+        clearExportPrepareState()
+        window.alert(message)
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      if (exportPrepareLongWaitTimerRef.current) {
+        window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+        exportPrepareLongWaitTimerRef.current = null
+      }
+    }
+  }, [clearExportPrepareState])
+
+  useEffect(() => {
+    if (!isPreparingExportDialog || !currentSessionId) return
+    if (!inProgressExportSessionIds.has(currentSessionId)) return
+    clearExportPrepareState()
+  }, [clearExportPrepareState, currentSessionId, inProgressExportSessionIds, isPreparingExportDialog])
 
   // 加载当前用户头像
   const loadMyAvatar = useCallback(async () => {
@@ -397,28 +787,857 @@ function ChatPage(_props: ChatPageProps) {
     }
   }, [])
 
+  const resolveChatCacheScope = useCallback(async (): Promise<string> => {
+    try {
+      const [dbPath, myWxid] = await Promise.all([
+        window.electronAPI.config.get('dbPath'),
+        window.electronAPI.config.get('myWxid')
+      ])
+      const scope = normalizeChatCacheScope(dbPath, myWxid)
+      chatCacheScopeRef.current = scope
+      return scope
+    } catch {
+      chatCacheScopeRef.current = 'default'
+      return 'default'
+    }
+  }, [])
+
+  const loadPreviewCacheFromStorage = useCallback((scope: string): Record<string, SessionPreviewCacheEntry> => {
+    try {
+      const cacheKey = buildChatSessionPreviewCacheKey(scope)
+      const payload = safeParseJson<SessionPreviewCachePayload>(window.localStorage.getItem(cacheKey))
+      if (!payload || typeof payload.updatedAt !== 'number' || !payload.entries) {
+        return {}
+      }
+      if (Date.now() - payload.updatedAt > CHAT_SESSION_PREVIEW_CACHE_TTL_MS) {
+        return {}
+      }
+      return payload.entries
+    } catch {
+      return {}
+    }
+  }, [])
+
+  const persistPreviewCacheToStorage = useCallback((scope: string, entries: Record<string, SessionPreviewCacheEntry>) => {
+    try {
+      const cacheKey = buildChatSessionPreviewCacheKey(scope)
+      const payload: SessionPreviewCachePayload = {
+        updatedAt: Date.now(),
+        entries
+      }
+      window.localStorage.setItem(cacheKey, JSON.stringify(payload))
+    } catch {
+      // ignore cache write failures
+    }
+  }, [])
+
+  const persistSessionPreviewCache = useCallback((sessionId: string, previewMessages: Message[]) => {
+    const id = String(sessionId || '').trim()
+    if (!id || !Array.isArray(previewMessages) || previewMessages.length === 0) return
+
+    const trimmed = previewMessages.slice(-CHAT_SESSION_PREVIEW_LIMIT_PER_SESSION)
+    const currentEntries = { ...previewCacheRef.current }
+    currentEntries[id] = {
+      updatedAt: Date.now(),
+      messages: trimmed
+    }
+
+    const sortedIds = Object.entries(currentEntries)
+      .sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0))
+      .map(([entryId]) => entryId)
+
+    const keptIds = new Set(sortedIds.slice(0, CHAT_SESSION_PREVIEW_MAX_SESSIONS))
+    const compactEntries: Record<string, SessionPreviewCacheEntry> = {}
+    for (const [entryId, entry] of Object.entries(currentEntries)) {
+      if (keptIds.has(entryId)) {
+        compactEntries[entryId] = entry
+      }
+    }
+
+    previewCacheRef.current = compactEntries
+    if (previewPersistTimerRef.current !== null) {
+      window.clearTimeout(previewPersistTimerRef.current)
+    }
+    previewPersistTimerRef.current = window.setTimeout(() => {
+      persistPreviewCacheToStorage(chatCacheScopeRef.current, previewCacheRef.current)
+      previewPersistTimerRef.current = null
+    }, 220)
+  }, [persistPreviewCacheToStorage])
+
+  const hydrateSessionPreview = useCallback(async (sessionId: string) => {
+    const id = String(sessionId || '').trim()
+    if (!id) return
+
+    const localEntry = previewCacheRef.current[id]
+    if (
+      localEntry &&
+      Array.isArray(localEntry.messages) &&
+      localEntry.messages.length > 0 &&
+      Date.now() - localEntry.updatedAt <= CHAT_SESSION_PREVIEW_CACHE_TTL_MS
+    ) {
+      setMessages(localEntry.messages.slice())
+      setHasInitialMessages(true)
+      return
+    }
+
+    try {
+      const result = await window.electronAPI.chat.getCachedMessages(id)
+      if (!result.success || !Array.isArray(result.messages) || result.messages.length === 0) {
+        return
+      }
+      if (currentSessionRef.current !== id && pendingSessionLoadRef.current !== id) return
+      setMessages(result.messages)
+      setHasInitialMessages(true)
+      persistSessionPreviewCache(id, result.messages)
+    } catch {
+      // ignore preview cache errors
+    }
+  }, [persistSessionPreviewCache, setMessages])
+
+  const saveSessionWindowCache = useCallback((sessionId: string, entry: Omit<SessionWindowCacheEntry, 'updatedAt'>) => {
+    const id = String(sessionId || '').trim()
+    if (!id || !Array.isArray(entry.messages) || entry.messages.length === 0) return
+
+    const trimmedMessages = entry.messages.length > CHAT_SESSION_WINDOW_CACHE_MAX_MESSAGES
+      ? entry.messages.slice(-CHAT_SESSION_WINDOW_CACHE_MAX_MESSAGES)
+      : entry.messages.slice()
+
+    const cache = sessionWindowCacheRef.current
+    cache.set(id, {
+      updatedAt: Date.now(),
+      ...entry,
+      messages: trimmedMessages,
+      currentOffset: trimmedMessages.length
+    })
+
+    if (cache.size <= CHAT_SESSION_WINDOW_CACHE_MAX_SESSIONS) return
+
+    const sortedByTime = [...cache.entries()]
+      .sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0))
+
+    for (const [key] of sortedByTime) {
+      if (cache.size <= CHAT_SESSION_WINDOW_CACHE_MAX_SESSIONS) break
+      cache.delete(key)
+    }
+  }, [])
+
+  const restoreSessionWindowCache = useCallback((sessionId: string): boolean => {
+    const id = String(sessionId || '').trim()
+    if (!id) return false
+
+    const cache = sessionWindowCacheRef.current
+    const entry = cache.get(id)
+    if (!entry) return false
+    if (Date.now() - entry.updatedAt > CHAT_SESSION_WINDOW_CACHE_TTL_MS) {
+      cache.delete(id)
+      return false
+    }
+    if (!Array.isArray(entry.messages) || entry.messages.length === 0) {
+      cache.delete(id)
+      return false
+    }
+
+    // LRU: 命中后更新时间
+    cache.set(id, {
+      ...entry,
+      updatedAt: Date.now(),
+      messages: entry.messages.slice()
+    })
+
+    setMessages(entry.messages.slice())
+    setCurrentOffset(entry.messages.length)
+    setHasMoreMessages(entry.hasMoreMessages !== false)
+    setHasMoreLater(entry.hasMoreLater === true)
+    setJumpStartTime(entry.jumpStartTime || 0)
+    setJumpEndTime(entry.jumpEndTime || 0)
+    setNoMessageTable(false)
+    setHasInitialMessages(true)
+    return true
+  }, [
+    setMessages,
+    setHasMoreMessages,
+    setHasMoreLater,
+    setCurrentOffset,
+    setJumpStartTime,
+    setJumpEndTime,
+    setNoMessageTable,
+    setHasInitialMessages
+  ])
+
+  const hydrateSessionListCache = useCallback((scope: string): boolean => {
+    try {
+      const cacheKey = buildChatSessionListCacheKey(scope)
+      const payload = safeParseJson<SessionListCachePayload>(window.localStorage.getItem(cacheKey))
+      if (!payload || typeof payload.updatedAt !== 'number' || !Array.isArray(payload.sessions)) {
+        previewCacheRef.current = loadPreviewCacheFromStorage(scope)
+        return false
+      }
+      previewCacheRef.current = loadPreviewCacheFromStorage(scope)
+      if (Date.now() - payload.updatedAt > CHAT_SESSION_LIST_CACHE_TTL_MS) {
+        return false
+      }
+      if (!Array.isArray(sessionsRef.current) || sessionsRef.current.length === 0) {
+        setSessions(payload.sessions)
+        sessionsRef.current = payload.sessions
+        return payload.sessions.length > 0
+      }
+      return false
+    } catch {
+      previewCacheRef.current = loadPreviewCacheFromStorage(scope)
+      return false
+    }
+  }, [loadPreviewCacheFromStorage, setSessions])
+
+  const persistSessionListCache = useCallback((scope: string, nextSessions: ChatSession[]) => {
+    try {
+      const cacheKey = buildChatSessionListCacheKey(scope)
+      const payload: SessionListCachePayload = {
+        updatedAt: Date.now(),
+        sessions: nextSessions
+      }
+      window.localStorage.setItem(cacheKey, JSON.stringify(payload))
+    } catch {
+      // ignore cache write failures
+    }
+  }, [])
+
+  const applySessionDetailStats = useCallback((
+    sessionId: string,
+    metric: SessionExportMetric,
+    cacheMeta?: SessionExportCacheMeta,
+    relationLoadedOverride?: boolean
+  ) => {
+    setSessionDetail((prev) => {
+      if (!prev || prev.wxid !== sessionId) return prev
+      const relationLoaded = relationLoadedOverride ?? Boolean(prev.relationStatsLoaded)
+      return {
+        ...prev,
+        messageCount: Number.isFinite(metric.totalMessages) ? metric.totalMessages : prev.messageCount,
+        voiceMessages: Number.isFinite(metric.voiceMessages) ? metric.voiceMessages : prev.voiceMessages,
+        imageMessages: Number.isFinite(metric.imageMessages) ? metric.imageMessages : prev.imageMessages,
+        videoMessages: Number.isFinite(metric.videoMessages) ? metric.videoMessages : prev.videoMessages,
+        emojiMessages: Number.isFinite(metric.emojiMessages) ? metric.emojiMessages : prev.emojiMessages,
+        transferMessages: Number.isFinite(metric.transferMessages) ? metric.transferMessages : prev.transferMessages,
+        redPacketMessages: Number.isFinite(metric.redPacketMessages) ? metric.redPacketMessages : prev.redPacketMessages,
+        callMessages: Number.isFinite(metric.callMessages) ? metric.callMessages : prev.callMessages,
+        groupMemberCount: Number.isFinite(metric.groupMemberCount) ? metric.groupMemberCount : prev.groupMemberCount,
+        groupMyMessages: Number.isFinite(metric.groupMyMessages) ? metric.groupMyMessages : prev.groupMyMessages,
+        groupActiveSpeakers: Number.isFinite(metric.groupActiveSpeakers) ? metric.groupActiveSpeakers : prev.groupActiveSpeakers,
+        privateMutualGroups: relationLoaded && Number.isFinite(metric.privateMutualGroups)
+          ? metric.privateMutualGroups
+          : prev.privateMutualGroups,
+        groupMutualFriends: relationLoaded && Number.isFinite(metric.groupMutualFriends)
+          ? metric.groupMutualFriends
+          : prev.groupMutualFriends,
+        relationStatsLoaded: relationLoaded,
+        statsUpdatedAt: cacheMeta?.updatedAt ?? prev.statsUpdatedAt,
+        statsStale: typeof cacheMeta?.stale === 'boolean' ? cacheMeta.stale : prev.statsStale,
+        firstMessageTime: Number.isFinite(metric.firstTimestamp) ? metric.firstTimestamp : prev.firstMessageTime,
+        latestMessageTime: Number.isFinite(metric.lastTimestamp) ? metric.lastTimestamp : prev.latestMessageTime
+      }
+    })
+  }, [])
+
   // 加载会话详情
   const loadSessionDetail = useCallback(async (sessionId: string) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return
+
+    const requestSeq = ++detailRequestSeqRef.current
+    const mappedSession = sessionMapRef.current.get(normalizedSessionId) || sessionsRef.current.find((s) => s.username === normalizedSessionId)
+    const hintedCount = typeof mappedSession?.messageCountHint === 'number' && Number.isFinite(mappedSession.messageCountHint) && mappedSession.messageCountHint >= 0
+      ? Math.floor(mappedSession.messageCountHint)
+      : undefined
+
+    setIsRefreshingDetailStats(false)
+    setIsLoadingRelationStats(false)
+    setSessionDetail((prev) => {
+      const sameSession = prev?.wxid === normalizedSessionId
+      return {
+        wxid: normalizedSessionId,
+        displayName: mappedSession?.displayName || prev?.displayName || normalizedSessionId,
+        remark: sameSession ? prev?.remark : undefined,
+        nickName: sameSession ? prev?.nickName : undefined,
+        alias: sameSession ? prev?.alias : undefined,
+        avatarUrl: mappedSession?.avatarUrl || (sameSession ? prev?.avatarUrl : undefined),
+        messageCount: hintedCount ?? (sameSession ? prev.messageCount : Number.NaN),
+        voiceMessages: sameSession ? prev?.voiceMessages : undefined,
+        imageMessages: sameSession ? prev?.imageMessages : undefined,
+        videoMessages: sameSession ? prev?.videoMessages : undefined,
+        emojiMessages: sameSession ? prev?.emojiMessages : undefined,
+        transferMessages: sameSession ? prev?.transferMessages : undefined,
+        redPacketMessages: sameSession ? prev?.redPacketMessages : undefined,
+        callMessages: sameSession ? prev?.callMessages : undefined,
+        privateMutualGroups: sameSession ? prev?.privateMutualGroups : undefined,
+        groupMemberCount: sameSession ? prev?.groupMemberCount : undefined,
+        groupMyMessages: sameSession ? prev?.groupMyMessages : undefined,
+        groupActiveSpeakers: sameSession ? prev?.groupActiveSpeakers : undefined,
+        groupMutualFriends: sameSession ? prev?.groupMutualFriends : undefined,
+        relationStatsLoaded: sameSession ? prev?.relationStatsLoaded : false,
+        statsUpdatedAt: sameSession ? prev?.statsUpdatedAt : undefined,
+        statsStale: sameSession ? prev?.statsStale : undefined,
+        firstMessageTime: sameSession ? prev?.firstMessageTime : undefined,
+        latestMessageTime: sameSession ? prev?.latestMessageTime : undefined,
+        messageTables: sameSession && Array.isArray(prev?.messageTables) ? prev.messageTables : []
+      }
+    })
     setIsLoadingDetail(true)
+    setIsLoadingDetailExtra(true)
+
+    if (normalizedSessionId.includes('@chatroom')) {
+      void (async () => {
+        try {
+          const hintResult = await window.electronAPI.chat.getGroupMyMessageCountHint(normalizedSessionId)
+          if (requestSeq !== detailRequestSeqRef.current) return
+          if (!hintResult.success || !Number.isFinite(hintResult.count)) return
+          const hintedMyCount = Math.max(0, Math.floor(hintResult.count as number))
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              groupMyMessages: hintedMyCount
+            }
+          })
+        } catch {
+          // ignore hint errors
+        }
+      })()
+    }
+
     try {
-      const result = await window.electronAPI.chat.getSessionDetail(sessionId)
+      const result = await window.electronAPI.chat.getSessionDetailFast(normalizedSessionId)
+      if (requestSeq !== detailRequestSeqRef.current) return
       if (result.success && result.detail) {
-        setSessionDetail(result.detail)
+        setSessionDetail((prev) => ({
+          wxid: normalizedSessionId,
+          displayName: result.detail!.displayName || prev?.displayName || normalizedSessionId,
+          remark: result.detail!.remark,
+          nickName: result.detail!.nickName,
+          alias: result.detail!.alias,
+          avatarUrl: result.detail!.avatarUrl || prev?.avatarUrl,
+          messageCount: Number.isFinite(result.detail!.messageCount) ? result.detail!.messageCount : prev?.messageCount ?? Number.NaN,
+          voiceMessages: prev?.voiceMessages,
+          imageMessages: prev?.imageMessages,
+          videoMessages: prev?.videoMessages,
+          emojiMessages: prev?.emojiMessages,
+          transferMessages: prev?.transferMessages,
+          redPacketMessages: prev?.redPacketMessages,
+          callMessages: prev?.callMessages,
+          privateMutualGroups: prev?.privateMutualGroups,
+          groupMemberCount: prev?.groupMemberCount,
+          groupMyMessages: prev?.groupMyMessages,
+          groupActiveSpeakers: prev?.groupActiveSpeakers,
+          groupMutualFriends: prev?.groupMutualFriends,
+          relationStatsLoaded: prev?.relationStatsLoaded,
+          statsUpdatedAt: prev?.statsUpdatedAt,
+          statsStale: prev?.statsStale,
+          firstMessageTime: prev?.firstMessageTime,
+          latestMessageTime: prev?.latestMessageTime,
+          messageTables: Array.isArray(prev?.messageTables) ? (prev?.messageTables || []) : []
+        }))
       }
     } catch (e) {
       console.error('加载会话详情失败:', e)
     } finally {
-      setIsLoadingDetail(false)
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingDetail(false)
+      }
+    }
+
+    try {
+      const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
+        window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
+        window.electronAPI.chat.getExportSessionStats(
+          [normalizedSessionId],
+          { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
+        )
+      ])
+
+      if (requestSeq !== detailRequestSeqRef.current) return
+
+      if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
+        const detail = extraResultSettled.value.detail
+        if (detail) {
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              firstMessageTime: detail.firstMessageTime,
+              latestMessageTime: detail.latestMessageTime,
+              messageTables: Array.isArray(detail.messageTables) ? detail.messageTables : []
+            }
+          })
+        }
+      }
+
+      let refreshIncludeRelations = false
+      if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
+        const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
+        const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+        refreshIncludeRelations = Boolean(cacheMeta?.includeRelations)
+        if (metric) {
+          applySessionDetailStats(normalizedSessionId, metric, cacheMeta, refreshIncludeRelations)
+        } else if (cacheMeta) {
+          setSessionDetail((prev) => {
+            if (!prev || prev.wxid !== normalizedSessionId) return prev
+            return {
+              ...prev,
+              relationStatsLoaded: refreshIncludeRelations || prev.relationStatsLoaded,
+              statsUpdatedAt: cacheMeta.updatedAt,
+              statsStale: cacheMeta.stale
+            }
+          })
+        }
+      }
+    } catch (e) {
+      console.error('加载会话详情补充统计失败:', e)
+    } finally {
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingDetailExtra(false)
+      }
+    }
+  }, [applySessionDetailStats])
+
+  const loadRelationStats = useCallback(async () => {
+    const normalizedSessionId = String(currentSessionId || '').trim()
+    if (!normalizedSessionId || isLoadingRelationStats) return
+
+    const requestSeq = detailRequestSeqRef.current
+    setIsLoadingRelationStats(true)
+    try {
+      const relationResult = await window.electronAPI.chat.getExportSessionStats(
+        [normalizedSessionId],
+        { includeRelations: true, forceRefresh: true, preferAccurateSpecialTypes: true }
+      )
+      if (requestSeq !== detailRequestSeqRef.current) return
+
+      const metric = relationResult.success && relationResult.data
+        ? relationResult.data[normalizedSessionId] as SessionExportMetric | undefined
+        : undefined
+      const cacheMeta = relationResult.success
+        ? relationResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+        : undefined
+      if (metric) {
+        applySessionDetailStats(normalizedSessionId, metric, cacheMeta, true)
+      }
+
+      const needRefresh = relationResult.success &&
+        Array.isArray(relationResult.needsRefresh) &&
+        relationResult.needsRefresh.includes(normalizedSessionId)
+
+      if (needRefresh) {
+        setIsRefreshingDetailStats(true)
+        void (async () => {
+          try {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: true, forceRefresh: true, preferAccurateSpecialTypes: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (freshMetric) {
+                applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, true)
+              }
+            }
+          } catch (error) {
+            console.error('刷新会话关系统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingDetailStats(false)
+            }
+          }
+        })()
+      }
+    } catch (error) {
+      console.error('加载会话关系统计失败:', error)
+    } finally {
+      if (requestSeq === detailRequestSeqRef.current) {
+        setIsLoadingRelationStats(false)
+      }
+    }
+  }, [applySessionDetailStats, currentSessionId, isLoadingRelationStats])
+
+  const normalizeGroupPanelMembers = useCallback((
+    payload: GroupPanelMember[],
+    options?: { messageCountStatus?: GroupMessageCountStatus }
+  ): GroupPanelMember[] => {
+    const membersPayload = Array.isArray(payload) ? payload : []
+    return membersPayload
+      .map((member: GroupPanelMember): GroupPanelMember | null => {
+        const username = String(member.username || '').trim()
+        if (!username) return null
+        const preferredName = String(
+          member.groupNickname ||
+          member.remark ||
+          member.displayName ||
+          member.nickname ||
+          username
+        )
+        const rawStatus = member.messageCountStatus
+        const normalizedStatus: GroupMessageCountStatus = options?.messageCountStatus
+          ?? (rawStatus === 'loading' || rawStatus === 'failed' ? rawStatus : 'ready')
+
+        return {
+          username,
+          displayName: preferredName,
+          avatarUrl: member.avatarUrl,
+          nickname: member.nickname,
+          alias: member.alias,
+          remark: member.remark,
+          groupNickname: member.groupNickname,
+          isOwner: Boolean(member.isOwner),
+          isFriend: Boolean(member.isFriend),
+          messageCount: Number.isFinite(member.messageCount) ? Math.max(0, Math.floor(member.messageCount)) : 0,
+          messageCountStatus: normalizedStatus
+        }
+      })
+      .filter((member: GroupPanelMember | null): member is GroupPanelMember => Boolean(member))
+      .sort((a: GroupPanelMember, b: GroupPanelMember) => {
+        const ownerDiff = Number(Boolean(b.isOwner)) - Number(Boolean(a.isOwner))
+        if (ownerDiff !== 0) return ownerDiff
+
+        const friendDiff = Number(b.isFriend) - Number(a.isFriend)
+        if (friendDiff !== 0) return friendDiff
+
+        const canSortByCount = a.messageCountStatus === 'ready' && b.messageCountStatus === 'ready'
+        if (canSortByCount && a.messageCount !== b.messageCount) return b.messageCount - a.messageCount
+        return a.displayName.localeCompare(b.displayName, 'zh-Hans-CN')
+      })
+  }, [])
+
+  const normalizeWxidLikeIdentity = useCallback((value?: string): string => {
+    const trimmed = String(value || '').trim()
+    if (!trimmed) return ''
+    const lowered = trimmed.toLowerCase()
+    if (lowered.startsWith('wxid_')) {
+      const matched = lowered.match(/^(wxid_[^_]+)/i)
+      return matched ? matched[1].toLowerCase() : lowered
+    }
+    const suffixMatch = lowered.match(/^(.+)_([a-z0-9]{4})$/i)
+    return suffixMatch ? suffixMatch[1].toLowerCase() : lowered
+  }, [])
+
+  const isSelfGroupMember = useCallback((memberUsername?: string): boolean => {
+    const selfRaw = String(myWxid || '').trim().toLowerCase()
+    const selfNormalized = normalizeWxidLikeIdentity(myWxid)
+    if (!selfRaw && !selfNormalized) return false
+    const memberRaw = String(memberUsername || '').trim().toLowerCase()
+    const memberNormalized = normalizeWxidLikeIdentity(memberUsername)
+    return Boolean(
+      (selfRaw && memberRaw && selfRaw === memberRaw) ||
+      (selfNormalized && memberNormalized && selfNormalized === memberNormalized)
+    )
+  }, [myWxid, normalizeWxidLikeIdentity])
+
+  const resolveMyGroupMessageCountFromMembers = useCallback((members: GroupPanelMember[]): number | undefined => {
+    if (!myWxid) return undefined
+
+    for (const member of members) {
+      if (!isSelfGroupMember(member.username)) continue
+      if (Number.isFinite(member.messageCount)) {
+        return Math.max(0, Math.floor(member.messageCount))
+      }
+      return 0
+    }
+
+    return undefined
+  }, [isSelfGroupMember, myWxid])
+
+  const syncGroupMyMessagesFromMembers = useCallback((chatroomId: string, members: GroupPanelMember[]) => {
+    const myMessageCount = resolveMyGroupMessageCountFromMembers(members)
+    if (!Number.isFinite(myMessageCount)) return
+
+    setSessionDetail((prev) => {
+      if (!prev || prev.wxid !== chatroomId || !prev.wxid.includes('@chatroom')) return prev
+      return {
+        ...prev,
+        groupMyMessages: myMessageCount as number
+      }
+    })
+  }, [resolveMyGroupMessageCountFromMembers])
+
+  const updateGroupMembersPanelCache = useCallback((
+    chatroomId: string,
+    members: GroupPanelMember[],
+    includeMessageCounts: boolean
+  ) => {
+    groupMembersPanelCacheRef.current.set(chatroomId, {
+      updatedAt: Date.now(),
+      members,
+      includeMessageCounts
+    })
+    if (groupMembersPanelCacheRef.current.size > 80) {
+      const oldestEntry = Array.from(groupMembersPanelCacheRef.current.entries())
+        .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0]
+      if (oldestEntry) {
+        groupMembersPanelCacheRef.current.delete(oldestEntry[0])
+      }
     }
   }, [])
 
+  const setGroupMembersCountStatus = useCallback((
+    status: GroupMessageCountStatus,
+    options?: { onlyWhenNotReady?: boolean }
+  ) => {
+    setGroupPanelMembers((prev) => {
+      if (!Array.isArray(prev) || prev.length === 0) return prev
+      if (options?.onlyWhenNotReady && prev.some((member) => member.messageCountStatus === 'ready')) {
+        return prev
+      }
+      const next = normalizeGroupPanelMembers(prev, { messageCountStatus: status })
+      const changed = next.some((member, index) => member.messageCountStatus !== prev[index]?.messageCountStatus)
+      return changed ? next : prev
+    })
+  }, [normalizeGroupPanelMembers])
+
+  const syncGroupMembersMyCountFromDetail = useCallback((chatroomId: string, myMessageCount: number) => {
+    if (!chatroomId || !chatroomId.includes('@chatroom')) return
+    const normalizedCount = Number.isFinite(myMessageCount) ? Math.max(0, Math.floor(myMessageCount)) : 0
+
+    const patchMembers = (members: GroupPanelMember[]): { changed: boolean; members: GroupPanelMember[] } => {
+      if (!Array.isArray(members) || members.length === 0) {
+        return { changed: false, members }
+      }
+      let changed = false
+      const patched = members.map((member) => {
+        if (!isSelfGroupMember(member.username)) return member
+        if (member.messageCount === normalizedCount) return member
+        changed = true
+        return {
+          ...member,
+          messageCount: normalizedCount
+        }
+      })
+      if (!changed) return { changed: false, members }
+      return { changed: true, members: normalizeGroupPanelMembers(patched) }
+    }
+
+    const cached = groupMembersPanelCacheRef.current.get(chatroomId)
+    if (cached && cached.members.length > 0) {
+      const patchedCache = patchMembers(cached.members)
+      if (patchedCache.changed) {
+        updateGroupMembersPanelCache(chatroomId, patchedCache.members, true)
+      }
+    }
+
+    setGroupPanelMembers((prev) => {
+      const patched = patchMembers(prev)
+      if (!patched.changed) return prev
+      return patched.members
+    })
+  }, [
+    isSelfGroupMember,
+    normalizeGroupPanelMembers,
+    updateGroupMembersPanelCache
+  ])
+
+  const getGroupMembersPanelDataWithTimeout = useCallback(async (
+    chatroomId: string,
+    options: { forceRefresh?: boolean; includeMessageCounts?: boolean },
+    timeoutMs: number
+  ) => {
+    let timeoutTimer: number | null = null
+    try {
+      const timeoutPromise = new Promise<{ success: false; error: string }>((resolve) => {
+        timeoutTimer = window.setTimeout(() => {
+          resolve({ success: false, error: '加载群成员超时，请稍后重试' })
+        }, timeoutMs)
+      })
+      return await Promise.race([
+        window.electronAPI.groupAnalytics.getGroupMembersPanelData(chatroomId, options),
+        timeoutPromise
+      ])
+    } finally {
+      if (timeoutTimer) {
+        window.clearTimeout(timeoutTimer)
+      }
+    }
+  }, [])
+
+  const loadGroupMembersPanel = useCallback(async (chatroomId: string) => {
+    if (!chatroomId || !isGroupChatSession(chatroomId)) return
+
+    const requestSeq = ++groupMembersRequestSeqRef.current
+    const now = Date.now()
+    const cached = groupMembersPanelCacheRef.current.get(chatroomId)
+    const cacheFresh = Boolean(cached && now - cached.updatedAt < GROUP_MEMBERS_PANEL_CACHE_TTL_MS)
+    const hasCachedMembers = Boolean(cached && cached.members.length > 0)
+    const hasFreshMessageCounts = Boolean(cacheFresh && cached?.includeMessageCounts)
+    let startedBackgroundRefresh = false
+
+    const refreshMessageCountsInBackground = (forceRefresh: boolean) => {
+      startedBackgroundRefresh = true
+      setIsRefreshingGroupMembers(true)
+      setGroupMembersCountStatus('loading', { onlyWhenNotReady: true })
+      void (async () => {
+        try {
+          const countsResult = await getGroupMembersPanelDataWithTimeout(
+            chatroomId,
+            { forceRefresh, includeMessageCounts: true },
+            25000
+          )
+          if (requestSeq !== groupMembersRequestSeqRef.current) return
+          if (!countsResult.success || !Array.isArray(countsResult.data)) {
+            setGroupMembersError('成员列表已加载，发言统计稍后再试')
+            setGroupMembersCountStatus('failed', { onlyWhenNotReady: true })
+            return
+          }
+
+          const membersWithCounts = normalizeGroupPanelMembers(
+            countsResult.data as GroupPanelMember[],
+            { messageCountStatus: 'ready' }
+          )
+          setGroupPanelMembers(membersWithCounts)
+          syncGroupMyMessagesFromMembers(chatroomId, membersWithCounts)
+          setGroupMembersError(null)
+          updateGroupMembersPanelCache(chatroomId, membersWithCounts, true)
+          hasInitializedGroupMembersRef.current = true
+        } catch {
+          if (requestSeq !== groupMembersRequestSeqRef.current) return
+          setGroupMembersError('成员列表已加载，发言统计稍后再试')
+          setGroupMembersCountStatus('failed', { onlyWhenNotReady: true })
+        } finally {
+          if (requestSeq === groupMembersRequestSeqRef.current) {
+            setIsRefreshingGroupMembers(false)
+          }
+        }
+      })()
+    }
+
+    if (cacheFresh && cached) {
+      const cachedMembers = normalizeGroupPanelMembers(
+        cached.members,
+        { messageCountStatus: cached.includeMessageCounts ? 'ready' : 'loading' }
+      )
+      setGroupPanelMembers(cachedMembers)
+      if (cached.includeMessageCounts) {
+        syncGroupMyMessagesFromMembers(chatroomId, cachedMembers)
+      }
+      setGroupMembersError(null)
+      setGroupMembersLoadingHint('')
+      setIsLoadingGroupMembers(false)
+      hasInitializedGroupMembersRef.current = true
+      if (!hasFreshMessageCounts) {
+        refreshMessageCountsInBackground(false)
+      } else {
+        setIsRefreshingGroupMembers(false)
+      }
+      return
+    }
+
+    setGroupMembersError(null)
+    if (hasCachedMembers && cached) {
+      const cachedMembers = normalizeGroupPanelMembers(
+        cached.members,
+        { messageCountStatus: cached.includeMessageCounts ? 'ready' : 'loading' }
+      )
+      setGroupPanelMembers(cachedMembers)
+      if (cached.includeMessageCounts) {
+        syncGroupMyMessagesFromMembers(chatroomId, cachedMembers)
+      }
+      setIsRefreshingGroupMembers(true)
+      setGroupMembersLoadingHint('')
+      setIsLoadingGroupMembers(false)
+    } else {
+      setGroupPanelMembers([])
+      setIsRefreshingGroupMembers(false)
+      setIsLoadingGroupMembers(true)
+      setGroupMembersLoadingHint(
+        hasInitializedGroupMembersRef.current
+          ? '加载群成员中...'
+          : '首次加载群成员，正在初始化索引（可能需要几秒）'
+      )
+    }
+
+    try {
+      const membersResult = await getGroupMembersPanelDataWithTimeout(
+        chatroomId,
+        { includeMessageCounts: false, forceRefresh: false },
+        12000
+      )
+      if (requestSeq !== groupMembersRequestSeqRef.current) return
+
+      if (!membersResult.success || !Array.isArray(membersResult.data)) {
+        if (!hasCachedMembers) {
+          setGroupPanelMembers([])
+        }
+        setGroupMembersError(membersResult.error || (hasCachedMembers ? '刷新群成员失败，已显示缓存数据' : '加载群成员失败'))
+        return
+      }
+
+      const members = normalizeGroupPanelMembers(
+        membersResult.data as GroupPanelMember[],
+        { messageCountStatus: 'loading' }
+      )
+      setGroupPanelMembers(members)
+      setGroupMembersError(null)
+      updateGroupMembersPanelCache(chatroomId, members, false)
+      hasInitializedGroupMembersRef.current = true
+      refreshMessageCountsInBackground(false)
+    } catch (e) {
+      if (requestSeq !== groupMembersRequestSeqRef.current) return
+      if (!hasCachedMembers) {
+        setGroupPanelMembers([])
+      }
+      setGroupMembersError(hasCachedMembers ? '刷新群成员失败，已显示缓存数据' : String(e))
+    } finally {
+      if (requestSeq === groupMembersRequestSeqRef.current) {
+        setIsLoadingGroupMembers(false)
+        setGroupMembersLoadingHint('')
+        if (!startedBackgroundRefresh) {
+          setIsRefreshingGroupMembers(false)
+        }
+      }
+    }
+  }, [
+    getGroupMembersPanelDataWithTimeout,
+    isGroupChatSession,
+    syncGroupMyMessagesFromMembers,
+    normalizeGroupPanelMembers,
+    updateGroupMembersPanelCache
+  ])
+
+  const toggleGroupMembersPanel = useCallback(() => {
+    if (!currentSessionId || !isGroupChatSession(currentSessionId)) return
+    if (showGroupMembersPanel) {
+      setShowGroupMembersPanel(false)
+      return
+    }
+    setShowDetailPanel(false)
+    setShowGroupMembersPanel(true)
+  }, [currentSessionId, showGroupMembersPanel, isGroupChatSession])
+
   // 切换详情面板
   const toggleDetailPanel = useCallback(() => {
-    if (!showDetailPanel && currentSessionId) {
-      loadSessionDetail(currentSessionId)
+    if (showDetailPanel) {
+      setShowDetailPanel(false)
+      return
     }
-    setShowDetailPanel(!showDetailPanel)
+    setShowGroupMembersPanel(false)
+    setShowDetailPanel(true)
+    if (currentSessionId) {
+      void loadSessionDetail(currentSessionId)
+    }
   }, [showDetailPanel, currentSessionId, loadSessionDetail])
+
+  useEffect(() => {
+    if (!showGroupMembersPanel) return
+    if (!currentSessionId || !isGroupChatSession(currentSessionId)) {
+      setShowGroupMembersPanel(false)
+      return
+    }
+    setGroupMemberSearchKeyword('')
+    void loadGroupMembersPanel(currentSessionId)
+  }, [showGroupMembersPanel, currentSessionId, loadGroupMembersPanel, isGroupChatSession])
+
+  useEffect(() => {
+    const chatroomId = String(sessionDetail?.wxid || '').trim()
+    if (!chatroomId || !chatroomId.includes('@chatroom')) return
+    if (!Number.isFinite(sessionDetail?.groupMyMessages)) return
+    syncGroupMembersMyCountFromDetail(chatroomId, sessionDetail!.groupMyMessages as number)
+  }, [sessionDetail?.groupMyMessages, sessionDetail?.wxid, syncGroupMembersMyCountFromDetail])
 
   // 复制字段值到剪贴板
   const handleCopyField = useCallback(async (text: string, field: string) => {
@@ -444,13 +1663,14 @@ function ChatPage(_props: ChatPageProps) {
     setConnecting(true)
     setConnectionError(null)
     try {
+      const scopePromise = resolveChatCacheScope()
       const result = await window.electronAPI.chat.connect()
       if (result.success) {
         setConnected(true)
-        await loadSessions()
-        await loadMyAvatar()
+        const wxidPromise = window.electronAPI.config.get('myWxid')
+        await Promise.all([scopePromise, loadSessions(), loadMyAvatar()])
         // 获取 myWxid 用于匹配个人头像
-        const wxid = await window.electronAPI.config.get('myWxid')
+        const wxid = await wxidPromise
         if (wxid) setMyWxid(wxid as string)
       } else {
         setConnectionError(result.error || '连接失败')
@@ -460,14 +1680,32 @@ function ChatPage(_props: ChatPageProps) {
     } finally {
       setConnecting(false)
     }
-  }, [loadMyAvatar])
+  }, [loadMyAvatar, resolveChatCacheScope])
 
   const handleAccountChanged = useCallback(async () => {
     senderAvatarCache.clear()
     senderAvatarLoading.clear()
     preloadImageKeysRef.current.clear()
     lastPreloadSessionRef.current = null
+    pendingSessionLoadRef.current = null
+    initialLoadRequestedSessionRef.current = null
+    sessionSwitchRequestSeqRef.current += 1
+    sessionWindowCacheRef.current.clear()
+    setIsSessionSwitching(false)
     setSessionDetail(null)
+    setIsRefreshingDetailStats(false)
+    setIsLoadingRelationStats(false)
+    setShowDetailPanel(false)
+    setShowGroupMembersPanel(false)
+    setGroupPanelMembers([])
+    setGroupMembersError(null)
+    setGroupMembersLoadingHint('')
+    setIsRefreshingGroupMembers(false)
+    setGroupMemberSearchKeyword('')
+    groupMembersRequestSeqRef.current += 1
+    groupMembersPanelCacheRef.current.clear()
+    hasInitializedGroupMembersRef.current = false
+    setIsLoadingGroupMembers(false)
     setCurrentSession(null)
     setSessions([])
     setFilteredSessions([])
@@ -478,9 +1716,13 @@ function ChatPage(_props: ChatPageProps) {
     setConnecting(false)
     setHasMoreMessages(true)
     setHasMoreLater(false)
+    const scope = await resolveChatCacheScope()
+    hydrateSessionListCache(scope)
     await connect()
   }, [
     connect,
+    resolveChatCacheScope,
+    hydrateSessionListCache,
     setConnected,
     setConnecting,
     setConnectionError,
@@ -491,13 +1733,67 @@ function ChatPage(_props: ChatPageProps) {
     setMessages,
     setSearchKeyword,
     setSessionDetail,
+    setShowDetailPanel,
+    setShowGroupMembersPanel,
     setSessions
   ])
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      const scope = await resolveChatCacheScope()
+      if (cancelled) return
+      hydrateSessionListCache(scope)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [resolveChatCacheScope, hydrateSessionListCache])
 
   // 同步 currentSessionId 到 ref
   useEffect(() => {
     currentSessionRef.current = currentSessionId
   }, [currentSessionId])
+
+  const hydrateSessionStatuses = useCallback(async (sessionList: ChatSession[]) => {
+    const usernames = sessionList.map((s) => s.username).filter(Boolean)
+    if (usernames.length === 0) return
+
+    try {
+      const result = await window.electronAPI.chat.getSessionStatuses(usernames)
+      if (!result.success || !result.map) return
+
+      const statusMap = result.map
+      const { sessions: latestSessions } = useChatStore.getState()
+      if (!Array.isArray(latestSessions) || latestSessions.length === 0) return
+
+      let hasChanges = false
+      const updatedSessions = latestSessions.map((session) => {
+        const status = statusMap[session.username]
+        if (!status) return session
+
+        const nextIsFolded = status.isFolded ?? session.isFolded
+        const nextIsMuted = status.isMuted ?? session.isMuted
+        if (nextIsFolded === session.isFolded && nextIsMuted === session.isMuted) {
+          return session
+        }
+
+        hasChanges = true
+        return {
+          ...session,
+          isFolded: nextIsFolded,
+          isMuted: nextIsMuted
+        }
+      })
+
+      if (hasChanges) {
+        setSessions(updatedSessions)
+      }
+    } catch (e) {
+      console.warn('会话状态补齐失败:', e)
+    }
+  }, [setSessions])
 
   // 加载会话列表（优化：先返回基础数据，异步加载联系人信息）
   const loadSessions = async (options?: { silent?: boolean }) => {
@@ -507,6 +1803,7 @@ function ChatPage(_props: ChatPageProps) {
       setLoadingSessions(true)
     }
     try {
+      const scope = await resolveChatCacheScope()
       const result = await window.electronAPI.chat.getSessions()
       if (result.success && result.sessions) {
         // 确保 sessions 是数组
@@ -518,11 +1815,16 @@ function ChatPage(_props: ChatPageProps) {
 
           setSessions(nextSessions)
           sessionsRef.current = nextSessions
+          persistSessionListCache(scope, nextSessions)
+          void hydrateSessionStatuses(nextSessions)
           // 立即启动联系人信息加载，不再延迟 500ms
           void enrichSessionsContactInfo(nextSessions)
         } else {
           console.error('mergeSessions returned non-array:', nextSessions)
           setSessions(sessionsArray)
+          sessionsRef.current = sessionsArray
+          persistSessionListCache(scope, sessionsArray)
+          void hydrateSessionStatuses(sessionsArray)
           void enrichSessionsContactInfo(sessionsArray)
         }
       } else if (!result.success) {
@@ -575,8 +1877,8 @@ function ChatPage(_props: ChatPageProps) {
 
 
 
-      // 进一步减少批次大小，每批3个，避免DLL调用阻塞
-      const batchSize = 3
+      // 批量补齐联系人，平衡吞吐和 UI 流畅性
+      const batchSize = 8
       let loadedCount = 0
 
       for (let i = 0; i < needEnrich.length; i += batchSize) {
@@ -585,7 +1887,7 @@ function ChatPage(_props: ChatPageProps) {
 
           // 等待滚动结束
           while (isScrollingRef.current && !enrichCancelledRef.current) {
-            await new Promise(resolve => setTimeout(resolve, 200))
+            await new Promise(resolve => setTimeout(resolve, 120))
           }
           if (enrichCancelledRef.current) break
         }
@@ -602,11 +1904,11 @@ function ChatPage(_props: ChatPageProps) {
           if ('requestIdleCallback' in window) {
             window.requestIdleCallback(() => {
               void loadContactInfoBatch(usernames).then(() => resolve())
-            }, { timeout: 2000 })
+            }, { timeout: 700 })
           } else {
             setTimeout(() => {
               void loadContactInfoBatch(usernames).then(() => resolve())
-            }, 300)
+            }, 80)
           }
         })
 
@@ -618,8 +1920,7 @@ function ChatPage(_props: ChatPageProps) {
 
         // 批次间延迟，给UI更多时间（DLL调用可能阻塞，需要更长的延迟）
         if (i + batchSize < needEnrich.length && !enrichCancelledRef.current) {
-          // 如果不在滚动，可以延迟短一点
-          const delay = isScrollingRef.current ? 1000 : 800
+          const delay = isScrollingRef.current ? 260 : 120
           await new Promise(resolve => setTimeout(resolve, delay))
         }
       }
@@ -649,17 +1950,17 @@ function ChatPage(_props: ChatPageProps) {
       contactUpdateTimerRef.current = null
     }
 
-    // 增加防抖延迟到500ms，避免在滚动时频繁更新
+    // 使用短防抖，让头像和昵称更快补齐但依然避免频繁重渲染
     contactUpdateTimerRef.current = window.setTimeout(() => {
       const updates = contactUpdateQueueRef.current
       if (updates.size === 0) return
 
       const now = Date.now()
-      // 如果距离上次更新太近（小于1秒），继续延迟
-      if (now - lastUpdateTimeRef.current < 1000) {
+      // 如果距离上次更新太近（小于250ms），继续延迟
+      if (now - lastUpdateTimeRef.current < 250) {
         contactUpdateTimerRef.current = window.setTimeout(() => {
           flushContactUpdates()
-        }, 1000 - (now - lastUpdateTimeRef.current))
+        }, 250 - (now - lastUpdateTimeRef.current))
         return
       }
 
@@ -696,7 +1997,7 @@ function ChatPage(_props: ChatPageProps) {
 
       updates.clear()
       contactUpdateTimerRef.current = null
-    }, 500) // 500ms 防抖，减少更新频率
+    }, 120)
   }, [setSessions])
 
   // 加载一批联系人信息并更新会话列表（优化：使用队列批量更新）
@@ -853,39 +2154,69 @@ function ChatPage(_props: ChatPageProps) {
       setIsRefreshingMessages(false)
     }
   }
-
-
-
-  // 动态游标批量大小控制
+  // 消息批量大小控制（保持稳定，避免游标反复重建）
   const currentBatchSizeRef = useRef(50)
 
+  const warmupGroupSenderProfiles = useCallback((usernames: string[], defer = false) => {
+    if (!Array.isArray(usernames) || usernames.length === 0) return
+
+    const runWarmup = () => {
+      const batchPromise = loadContactInfoBatch(usernames)
+      usernames.forEach(username => {
+        if (!senderAvatarLoading.has(username)) {
+          senderAvatarLoading.set(username, batchPromise.then(() => senderAvatarCache.get(username) || null))
+        }
+      })
+      batchPromise.finally(() => {
+        usernames.forEach(username => senderAvatarLoading.delete(username))
+      })
+    }
+
+    if (defer) {
+      if ('requestIdleCallback' in window) {
+        window.requestIdleCallback(() => {
+          runWarmup()
+        }, { timeout: 1200 })
+      } else {
+        globalThis.setTimeout(runWarmup, 120)
+      }
+      return
+    }
+
+    runWarmup()
+  }, [loadContactInfoBatch])
+
   // 加载消息
-  const loadMessages = async (sessionId: string, offset = 0, startTime = 0, endTime = 0, ascending = false) => {
+  const loadMessages = async (
+    sessionId: string,
+    offset = 0,
+    startTime = 0,
+    endTime = 0,
+    ascending = false,
+    options: LoadMessagesOptions = {}
+  ) => {
     const listEl = messageListRef.current
     const session = sessionMapRef.current.get(sessionId)
     const unreadCount = session?.unreadCount ?? 0
 
-    let messageLimit = 50
+    let messageLimit = currentBatchSizeRef.current
 
     if (offset === 0) {
-      // 初始加载：重置批量大小
-      currentBatchSizeRef.current = 50
-      // 首屏优化：消息过多时限制数量
-      messageLimit = unreadCount > 99 ? 30 : 50
+      const preferredLimit = Number.isFinite(options.forceInitialLimit)
+        ? Math.max(10, Math.floor(options.forceInitialLimit as number))
+        : (unreadCount > 99 ? 30 : 40)
+      currentBatchSizeRef.current = preferredLimit
+      messageLimit = preferredLimit
     } else {
-      // 滚动加载：动态递增 (50 -> 100 -> 200)
-      if (currentBatchSizeRef.current < 100) {
-        currentBatchSizeRef.current = 100
-      } else {
-        currentBatchSizeRef.current = 200
-      }
+      // 同一会话内保持固定批量，避免后端游标因 batch 改变而重建
       messageLimit = currentBatchSizeRef.current
     }
 
 
     if (offset === 0) {
       setLoadingMessages(true)
-      setMessages([])
+      // 切会话时保留旧内容作为过渡，避免大面积闪烁
+      setHasInitialMessages(true)
     } else {
       setLoadingMore(true)
     }
@@ -894,22 +2225,32 @@ function ChatPage(_props: ChatPageProps) {
     const firstMsgEl = listEl?.querySelector('.message-wrapper') as HTMLElement | null
 
     try {
-      const result = await window.electronAPI.chat.getMessages(sessionId, offset, messageLimit, startTime, endTime, ascending) as {
+      const useLatestPath = offset === 0 && startTime === 0 && endTime === 0 && !ascending && options.preferLatestPath
+      const result = (useLatestPath
+        ? await window.electronAPI.chat.getLatestMessages(sessionId, messageLimit)
+        : await window.electronAPI.chat.getMessages(sessionId, offset, messageLimit, startTime, endTime, ascending)
+      ) as {
         success: boolean;
         messages?: Message[];
         hasMore?: boolean;
         error?: string
       }
+      if (options.switchRequestSeq && options.switchRequestSeq !== sessionSwitchRequestSeqRef.current) {
+        return
+      }
+      if (currentSessionRef.current !== sessionId) {
+        return
+      }
       if (result.success && result.messages) {
         if (offset === 0) {
           setMessages(result.messages)
+          persistSessionPreviewCache(sessionId, result.messages)
           if (result.messages.length === 0) {
             setNoMessageTable(true)
             setHasMoreMessages(false)
           }
 
-          // 预取发送者信息：在关闭加载遮罩前处理
-          const unreadCount = session?.unreadCount ?? 0
+          // 群聊发送者信息补齐改为非阻塞执行，避免影响首屏切换
           const isGroup = sessionId.includes('@chatroom')
           if (isGroup && result.messages.length > 0) {
             const unknownSenders = [...new Set(result.messages
@@ -917,18 +2258,7 @@ function ChatPage(_props: ChatPageProps) {
               .map(m => m.senderUsername as string)
             )]
             if (unknownSenders.length > 0) {
-
-              // 在批量请求前，先将这些发送者标记为加载中，防止 MessageBubble 触发重复请求
-              const batchPromise = loadContactInfoBatch(unknownSenders)
-              unknownSenders.forEach(username => {
-                if (!senderAvatarLoading.has(username)) {
-                  senderAvatarLoading.set(username, batchPromise.then(() => senderAvatarCache.get(username) || null))
-                }
-              })
-              // 确保在请求完成后清理 loading 状态
-              batchPromise.finally(() => {
-                unknownSenders.forEach(username => senderAvatarLoading.delete(username))
-              })
+              warmupGroupSenderProfiles(unknownSenders, options.deferGroupSenderWarmup === true)
             }
           }
 
@@ -954,15 +2284,7 @@ function ChatPage(_props: ChatPageProps) {
               .map(m => m.senderUsername as string)
             )]
             if (unknownSenders.length > 0) {
-              const batchPromise = loadContactInfoBatch(unknownSenders)
-              unknownSenders.forEach(username => {
-                if (!senderAvatarLoading.has(username)) {
-                  senderAvatarLoading.set(username, batchPromise.then(() => senderAvatarCache.get(username) || null))
-                }
-              })
-              batchPromise.finally(() => {
-                unknownSenders.forEach(username => senderAvatarLoading.delete(username))
-              })
+              warmupGroupSenderProfiles(unknownSenders, false)
             }
           }
 
@@ -996,11 +2318,35 @@ function ChatPage(_props: ChatPageProps) {
       console.error('加载消息失败:', e)
       setConnectionError('加载消息失败')
       setHasMoreMessages(false)
+      if (offset === 0 && currentSessionRef.current === sessionId) {
+        setMessages([])
+      }
     } finally {
       setLoadingMessages(false)
       setLoadingMore(false)
+      if (offset === 0 && pendingSessionLoadRef.current === sessionId) {
+        if (!options.switchRequestSeq || options.switchRequestSeq === sessionSwitchRequestSeqRef.current) {
+          pendingSessionLoadRef.current = null
+          initialLoadRequestedSessionRef.current = null
+          setIsSessionSwitching(false)
+        }
+      }
     }
   }
+
+  const handleJumpDateSelect = useCallback((date: Date) => {
+    if (!currentSessionId) return
+    const targetDate = new Date(date)
+    const end = Math.floor(targetDate.setHours(23, 59, 59, 999) / 1000)
+    // 日期跳转采用“锚点定位”而非“当天过滤”：
+    // 先定位到当日附近，再允许上下滚动跨天浏览。
+    isDateJumpRef.current = false
+    setCurrentOffset(0)
+    setJumpStartTime(0)
+    setJumpEndTime(end)
+    setShowJumpPopover(false)
+    void loadMessages(currentSessionId, 0, 0, end, false)
+  }, [currentSessionId, loadMessages])
 
   // 加载更晚的消息
   const loadLaterMessages = useCallback(async () => {
@@ -1034,6 +2380,86 @@ function ChatPage(_props: ChatPageProps) {
     }
   }, [currentSessionId, isLoadingMore, isLoadingMessages, messages, getMessageKey, appendMessages, setHasMoreLater, setLoadingMore])
 
+  const refreshSessionIncrementally = useCallback(async (sessionId: string, switchRequestSeq?: number) => {
+    const currentMessages = useChatStore.getState().messages || []
+    const lastMsg = currentMessages[currentMessages.length - 1]
+    const minTime = lastMsg?.createTime || 0
+    if (!sessionId || minTime <= 0) return
+
+    try {
+      const result = await window.electronAPI.chat.getNewMessages(sessionId, minTime, 120) as {
+        success: boolean
+        messages?: Message[]
+        error?: string
+      }
+      if (switchRequestSeq && switchRequestSeq !== sessionSwitchRequestSeqRef.current) return
+      if (currentSessionRef.current !== sessionId) return
+      if (!result.success || !Array.isArray(result.messages) || result.messages.length === 0) return
+
+      const latestMessages = useChatStore.getState().messages || []
+      const existing = new Set(latestMessages.map(getMessageKey))
+      const newMessages = result.messages.filter((msg) => !existing.has(getMessageKey(msg)))
+      if (newMessages.length > 0) {
+        appendMessages(newMessages, false)
+      }
+    } catch (error) {
+      console.warn('[SessionCache] 增量刷新失败:', error)
+    }
+  }, [appendMessages, getMessageKey])
+
+  // 选择会话
+  const selectSessionById = useCallback((sessionId: string) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId || normalizedSessionId === currentSessionId) return
+    const switchRequestSeq = sessionSwitchRequestSeqRef.current + 1
+    sessionSwitchRequestSeqRef.current = switchRequestSeq
+
+    setCurrentSession(normalizedSessionId, { preserveMessages: false })
+    setNoMessageTable(false)
+
+    const restoredFromWindowCache = restoreSessionWindowCache(normalizedSessionId)
+    if (restoredFromWindowCache) {
+      pendingSessionLoadRef.current = null
+      initialLoadRequestedSessionRef.current = null
+      setIsSessionSwitching(false)
+      void refreshSessionIncrementally(normalizedSessionId, switchRequestSeq)
+    } else {
+      pendingSessionLoadRef.current = normalizedSessionId
+      initialLoadRequestedSessionRef.current = normalizedSessionId
+      setIsSessionSwitching(true)
+      void hydrateSessionPreview(normalizedSessionId)
+      setCurrentOffset(0)
+      setJumpStartTime(0)
+      setJumpEndTime(0)
+      void loadMessages(normalizedSessionId, 0, 0, 0, false, {
+        preferLatestPath: true,
+        deferGroupSenderWarmup: true,
+        forceInitialLimit: 30,
+        switchRequestSeq
+      })
+    }
+    // 切换会话后回到正常聊天窗口：收起详情侧栏，详情需手动再次展开
+    setShowJumpPopover(false)
+    setShowDetailPanel(false)
+    setShowGroupMembersPanel(false)
+    setGroupMemberSearchKeyword('')
+    setGroupMembersError(null)
+    setGroupMembersLoadingHint('')
+    setIsRefreshingGroupMembers(false)
+    groupMembersRequestSeqRef.current += 1
+    setIsLoadingGroupMembers(false)
+    setSessionDetail(null)
+    setIsRefreshingDetailStats(false)
+    setIsLoadingRelationStats(false)
+  }, [
+    currentSessionId,
+    setCurrentSession,
+    restoreSessionWindowCache,
+    refreshSessionIncrementally,
+    hydrateSessionPreview,
+    loadMessages
+  ])
+
   // 选择会话
   const handleSelectSession = (session: ChatSession) => {
     // 点击折叠群入口，切换到折叠群视图
@@ -1041,17 +2467,7 @@ function ChatPage(_props: ChatPageProps) {
       setFoldedView(true)
       return
     }
-    if (session.username === currentSessionId) return
-    setCurrentSession(session.username)
-    setCurrentOffset(0)
-    setJumpStartTime(0)
-    setJumpEndTime(0)
-    loadMessages(session.username, 0, 0, 0)
-    // 重置详情面板
-    setSessionDetail(null)
-    if (showDetailPanel) {
-      loadSessionDetail(session.username)
-    }
+    selectSessionById(session.username)
   }
 
   // 搜索过滤
@@ -1185,6 +2601,14 @@ function ChatPage(_props: ChatPageProps) {
     // 组件卸载时清理
     return () => {
       avatarLoadQueue.clear()
+      if (previewPersistTimerRef.current !== null) {
+        window.clearTimeout(previewPersistTimerRef.current)
+        previewPersistTimerRef.current = null
+      }
+      if (sessionListPersistTimerRef.current !== null) {
+        window.clearTimeout(sessionListPersistTimerRef.current)
+        sessionListPersistTimerRef.current = null
+      }
       if (contactUpdateTimerRef.current) {
         clearTimeout(contactUpdateTimerRef.current)
       }
@@ -1311,8 +2735,15 @@ function ChatPage(_props: ChatPageProps) {
 
   useEffect(() => {
     if (currentSessionId && messages.length === 0 && !isLoadingMessages && !isLoadingMore && !noMessageTable) {
+      if (pendingSessionLoadRef.current === currentSessionId) return
+      if (initialLoadRequestedSessionRef.current === currentSessionId) return
+      initialLoadRequestedSessionRef.current = currentSessionId
       setHasInitialMessages(false)
-      loadMessages(currentSessionId, 0)
+      void loadMessages(currentSessionId, 0, 0, 0, false, {
+        preferLatestPath: true,
+        deferGroupSenderWarmup: true,
+        forceInitialLimit: 30
+      })
     }
   }, [currentSessionId, messages.length, isLoadingMessages, isLoadingMore, noMessageTable])
 
@@ -1332,6 +2763,79 @@ function ChatPage(_props: ChatPageProps) {
   useEffect(() => {
     searchKeywordRef.current = searchKeyword
   }, [searchKeyword])
+
+  useEffect(() => {
+    if (!showJumpPopover) return
+    const handleGlobalPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (jumpCalendarWrapRef.current?.contains(target)) return
+      if (jumpPopoverPortalRef.current?.contains(target)) return
+      setShowJumpPopover(false)
+    }
+    document.addEventListener('mousedown', handleGlobalPointerDown)
+    return () => {
+      document.removeEventListener('mousedown', handleGlobalPointerDown)
+    }
+  }, [showJumpPopover])
+
+  useEffect(() => {
+    if (!showJumpPopover) return
+    const syncPosition = () => {
+      requestAnimationFrame(() => updateJumpPopoverPosition())
+    }
+
+    syncPosition()
+    window.addEventListener('resize', syncPosition)
+    window.addEventListener('scroll', syncPosition, true)
+    return () => {
+      window.removeEventListener('resize', syncPosition)
+      window.removeEventListener('scroll', syncPosition, true)
+    }
+  }, [showJumpPopover, updateJumpPopoverPosition])
+
+  useEffect(() => {
+    setShowJumpPopover(false)
+    setLoadingDates(false)
+    setLoadingDateCounts(false)
+    setHasLoadedMessageDates(false)
+    setMessageDates(new Set())
+    setMessageDateCounts({})
+  }, [currentSessionId])
+
+  useEffect(() => {
+    if (!currentSessionId || !Array.isArray(messages) || messages.length === 0) return
+    persistSessionPreviewCache(currentSessionId, messages)
+    saveSessionWindowCache(currentSessionId, {
+      messages,
+      currentOffset,
+      hasMoreMessages,
+      hasMoreLater,
+      jumpStartTime,
+      jumpEndTime
+    })
+  }, [
+    currentSessionId,
+    messages,
+    currentOffset,
+    hasMoreMessages,
+    hasMoreLater,
+    jumpStartTime,
+    jumpEndTime,
+    persistSessionPreviewCache,
+    saveSessionWindowCache
+  ])
+
+  useEffect(() => {
+    if (!Array.isArray(sessions) || sessions.length === 0) return
+    if (sessionListPersistTimerRef.current !== null) {
+      window.clearTimeout(sessionListPersistTimerRef.current)
+    }
+    sessionListPersistTimerRef.current = window.setTimeout(() => {
+      persistSessionListCache(chatCacheScopeRef.current, sessions)
+      sessionListPersistTimerRef.current = null
+    }, 260)
+  }, [sessions, persistSessionListCache])
 
   // 普通视图：隐藏 isFolded 的群，保留 placeholder_foldgroup 入口
   useEffect(() => {
@@ -1367,6 +2871,10 @@ function ChatPage(_props: ChatPageProps) {
       s.summary.toLowerCase().includes(lower)
     )
   }, [sessions, searchKeyword, foldedView])
+
+  const hasSessionRecords = Array.isArray(sessions) && sessions.length > 0
+  const shouldShowSessionsSkeleton = isLoadingSessions && !hasSessionRecords
+  const isSessionListSyncing = (isLoadingSessions || isRefreshingSessions) && hasSessionRecords
 
 
   // 格式化会话时间（相对时间）- 使用 useMemo 缓存，避免每次渲染都计算
@@ -1410,6 +2918,38 @@ function ChatPage(_props: ChatPageProps) {
       displayName: fallbackDisplayName || currentSessionId,
     } as ChatSession
   })()
+  const filteredGroupPanelMembers = useMemo(() => {
+    const keyword = groupMemberSearchKeyword.trim().toLowerCase()
+    if (!keyword) return groupPanelMembers
+    return groupPanelMembers.filter((member) => {
+      const fields = [
+        member.username,
+        member.displayName,
+        member.groupNickname,
+        member.remark,
+        member.nickname,
+        member.alias
+      ]
+      return fields.some(field => String(field || '').toLowerCase().includes(keyword))
+    })
+  }, [groupMemberSearchKeyword, groupPanelMembers])
+  const isCurrentSessionExporting = Boolean(currentSessionId && inProgressExportSessionIds.has(currentSessionId))
+  const isExportActionBusy = isCurrentSessionExporting || isPreparingExportDialog
+
+  useEffect(() => {
+    if (!standaloneSessionWindow) return
+    if (!normalizedInitialSessionId) return
+    if (!isConnected || isConnecting) return
+    if (currentSessionId === normalizedInitialSessionId) return
+    selectSessionById(normalizedInitialSessionId)
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    isConnected,
+    isConnecting,
+    currentSessionId,
+    selectSessionById
+  ])
 
   // 从通讯录跳转时，会话不在列表中，主动加载联系人显示名称
   useEffect(() => {
@@ -1424,9 +2964,6 @@ function ChatPage(_props: ChatPageProps) {
       if (cached?.displayName) setFallbackDisplayName(cached.displayName)
     })
   }, [currentSessionId, sessions])
-
-  // 判断是否为群聊
-  const isGroupChat = (username: string) => username.includes('@chatroom')
 
   // 渲染日期分隔
   const shouldShowDateDivider = (msg: Message, prevMsg?: Message): boolean => {
@@ -1526,21 +3063,32 @@ function ChatPage(_props: ChatPageProps) {
 
   const handleExportCurrentSession = useCallback(() => {
     if (!currentSessionId) return
-    navigate('/export', {
-      state: {
-        preselectSessionIds: [currentSessionId]
-      }
+    if (inProgressExportSessionIds.has(currentSessionId) || isPreparingExportDialog) return
+
+    const requestId = `chat-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const sessionName = currentSession?.displayName || currentSession?.username || currentSessionId
+    pendingExportRequestIdRef.current = requestId
+    setIsPreparingExportDialog(true)
+    setExportPrepareHint('')
+    if (exportPrepareLongWaitTimerRef.current) {
+      window.clearTimeout(exportPrepareLongWaitTimerRef.current)
+      exportPrepareLongWaitTimerRef.current = null
+    }
+    emitOpenSingleExport({
+      sessionId: currentSessionId,
+      sessionName,
+      requestId
     })
-  }, [currentSessionId, navigate])
+  }, [currentSession, currentSessionId, inProgressExportSessionIds, isPreparingExportDialog])
 
   const handleGroupAnalytics = useCallback(() => {
-    if (!currentSessionId || !isGroupChat(currentSessionId)) return
+    if (!currentSessionId || !isGroupChatSession(currentSessionId)) return
     navigate('/group-analytics', {
       state: {
         preselectGroupIds: [currentSessionId]
       }
     })
-  }, [currentSessionId, navigate])
+  }, [currentSessionId, navigate, isGroupChatSession])
 
   // 确认批量转写
   const confirmBatchTranscribe = useCallback(async () => {
@@ -1969,7 +3517,7 @@ function ChatPage(_props: ChatPageProps) {
   }
 
   return (
-    <div className={`chat-page ${isResizing ? 'resizing' : ''}`}>
+    <div className={`chat-page ${isResizing ? 'resizing' : ''} ${standaloneSessionWindow ? 'standalone session-only' : ''}`}>
       {/* 自定义删除确认对话框 */}
       {deleteConfirm.show && (
         <div className="delete-confirm-overlay">
@@ -2041,6 +3589,7 @@ function ChatPage(_props: ChatPageProps) {
         </div>
       )}
       {/* 左侧会话列表 */}
+      {!standaloneSessionWindow && (
       <div
         className="session-sidebar"
         ref={sidebarRef}
@@ -2068,6 +3617,12 @@ function ChatPage(_props: ChatPageProps) {
               <button className="icon-btn refresh-btn" onClick={handleRefresh} disabled={isLoadingSessions || isRefreshingSessions}>
                 <RefreshCw size={16} className={(isLoadingSessions || isRefreshingSessions) ? 'spin' : ''} />
               </button>
+              {isSessionListSyncing && (
+                <div className="session-sync-indicator">
+                  <Loader2 size={12} className="spin" />
+                  <span>同步中</span>
+                </div>
+              )}
             </div>
           </div>
           {/* 折叠群 header */}
@@ -2093,7 +3648,7 @@ function ChatPage(_props: ChatPageProps) {
         )}
 
         {/* ... (previous content) ... */}
-        {isLoadingSessions ? (
+        {shouldShowSessionsSkeleton ? (
           <div className="loading-sessions">
             {[1, 2, 3, 4, 5].map(i => (
               <div key={i} className="skeleton-item">
@@ -2169,9 +3724,10 @@ function ChatPage(_props: ChatPageProps) {
 
 
       </div>
+      )}
 
       {/* 拖动调节条 */}
-      <div className="resize-handle" onMouseDown={handleResizeStart} />
+      {!standaloneSessionWindow && <div className="resize-handle" onMouseDown={handleResizeStart} />}
 
       {/* 右侧消息区域 */}
       <div className="message-area">
@@ -2182,16 +3738,16 @@ function ChatPage(_props: ChatPageProps) {
                 src={currentSession.avatarUrl}
                 name={currentSession.displayName || currentSession.username}
                 size={40}
-                className={isGroupChat(currentSession.username) ? 'group session-avatar' : 'session-avatar'}
+                className={isGroupChatSession(currentSession.username) ? 'group session-avatar' : 'session-avatar'}
               />
               <div className="header-info">
                 <h3>{currentSession.displayName || currentSession.username}</h3>
-                {isGroupChat(currentSession.username) && (
+                {isGroupChatSession(currentSession.username) && (
                   <div className="header-subtitle">群聊</div>
                 )}
               </div>
               <div className="header-actions">
-                {isGroupChat(currentSession.username) && (
+                {!standaloneSessionWindow && isGroupChatSession(currentSession.username) && (
                   <button
                     className="icon-btn group-analytics-btn"
                     onClick={handleGroupAnalytics}
@@ -2200,99 +3756,105 @@ function ChatPage(_props: ChatPageProps) {
                     <BarChart3 size={18} />
                   </button>
                 )}
-                <button
-                  className="icon-btn export-session-btn"
-                  onClick={handleExportCurrentSession}
-                  disabled={!currentSessionId}
-                  title="导出当前会话"
-                >
-                  <Download size={18} />
-                </button>
-                <button
-                  className={`icon-btn batch-transcribe-btn${isBatchTranscribing ? ' transcribing' : ''}`}
-                  onClick={() => {
-                    if (isBatchTranscribing) {
-                      setShowBatchProgress(true)
-                    } else {
-                      handleBatchTranscribe()
-                    }
-                  }}
-                  disabled={!currentSessionId}
-                  title={isBatchTranscribing ? `批量转写中 (${batchTranscribeProgress.current}/${batchTranscribeProgress.total})，点击查看进度` : '批量语音转文字'}
-                >
-                  {isBatchTranscribing ? (
-                    <Loader2 size={18} className="spin" />
-                  ) : (
-                    <Mic size={18} />
-                  )}
-                </button>
-                <button
-                  className={`icon-btn batch-decrypt-btn${isBatchDecrypting ? ' transcribing' : ''}`}
-                  onClick={() => {
-                    if (isBatchDecrypting) {
-                      setShowBatchDecryptToast(true)
-                    } else {
-                      handleBatchDecrypt()
-                    }
-                  }}
-                  disabled={!currentSessionId}
-                  title={isBatchDecrypting
-                    ? `批量解密中 (${batchDecryptProgress.current}/${batchDecryptProgress.total})，点击查看进度`
-                    : '批量解密图片'}
-                >
-                  {isBatchDecrypting ? (
-                    <Loader2 size={18} className="spin" />
-                  ) : (
-                    <ImageIcon size={18} />
-                  )}
-                </button>
-                <button
-                  className="icon-btn jump-to-time-btn"
-                  onClick={async () => {
-                    setShowJumpDialog(true)
-                    if (!currentSessionId) return
-                    // 检查缓存
-                    const cached = messageDatesCache.current.get(currentSessionId)
-                    if (cached) {
-                      setMessageDates(cached)
-                      return
-                    }
-                    // 获取消息日期
-                    setMessageDates(new Set()) // 清除旧数据
-                    setLoadingDates(true)
-                    try {
-                      const result = await (window as any).electronAPI.chat.getMessageDates(currentSessionId)
-                      if (result?.success && result.dates) {
-                        const dateSet = new Set<string>(result.dates)
-                        setMessageDates(dateSet)
-                        messageDatesCache.current.set(currentSessionId, dateSet)
+                {isGroupChatSession(currentSession.username) && (
+                  <button
+                    className={`icon-btn group-members-btn ${showGroupMembersPanel ? 'active' : ''}`}
+                    onClick={toggleGroupMembersPanel}
+                    title="群成员"
+                  >
+                    <Users size={18} />
+                  </button>
+                )}
+                {!standaloneSessionWindow && (
+                  <button
+                    className={`icon-btn export-session-btn${isExportActionBusy ? ' exporting' : ''}`}
+                    onClick={handleExportCurrentSession}
+                    disabled={!currentSessionId || isExportActionBusy}
+                    title={isCurrentSessionExporting ? '导出中' : isPreparingExportDialog ? '正在准备导出模块' : '导出当前会话'}
+                  >
+                    {isExportActionBusy ? (
+                      <Loader2 size={18} className="spin" />
+                    ) : (
+                      <Download size={18} />
+                    )}
+                  </button>
+                )}
+                {!standaloneSessionWindow && (
+                  <button
+                    className={`icon-btn batch-transcribe-btn${isBatchTranscribing ? ' transcribing' : ''}`}
+                    onClick={() => {
+                      if (isBatchTranscribing) {
+                        setShowBatchProgress(true)
+                      } else {
+                        handleBatchTranscribe()
                       }
-                    } catch (e) {
-                      console.error('获取消息日期失败:', e)
-                    } finally {
-                      setLoadingDates(false)
-                    }
-                  }}
-                  title="跳转到指定时间"
-                >
-                  <Calendar size={18} />
-                </button>
-                <JumpToDateDialog
-                  isOpen={showJumpDialog}
-                  onClose={() => setShowJumpDialog(false)}
-                  onSelect={(date) => {
-                    if (!currentSessionId) return
-                    const start = Math.floor(date.setHours(0, 0, 0, 0) / 1000)
-                    const end = Math.floor(date.setHours(23, 59, 59, 999) / 1000)
-                    isDateJumpRef.current = true
-                    setCurrentOffset(0)
-                    setJumpStartTime(start)
-                    setJumpEndTime(end)
-                    loadMessages(currentSessionId, 0, start, end, true)
-                  }}
-                  messageDates={messageDates}
-                  loadingDates={loadingDates}
-                />
+                    }}
+                    disabled={!currentSessionId}
+                    title={isBatchTranscribing ? `批量转写中 (${batchTranscribeProgress.current}/${batchTranscribeProgress.total})，点击查看进度` : '批量语音转文字'}
+                  >
+                    {isBatchTranscribing ? (
+                      <Loader2 size={18} className="spin" />
+                    ) : (
+                      <Mic size={18} />
+                    )}
+                  </button>
+                )}
+                {!standaloneSessionWindow && (
+                  <button
+                    className={`icon-btn batch-decrypt-btn${isBatchDecrypting ? ' transcribing' : ''}`}
+                    onClick={() => {
+                      if (isBatchDecrypting) {
+                        setShowBatchDecryptToast(true)
+                      } else {
+                        handleBatchDecrypt()
+                      }
+                    }}
+                    disabled={!currentSessionId}
+                    title={isBatchDecrypting
+                      ? `批量解密中 (${batchDecryptProgress.current}/${batchDecryptProgress.total})，点击查看进度`
+                      : '批量解密图片'}
+                  >
+                    {isBatchDecrypting ? (
+                      <Loader2 size={18} className="spin" />
+                    ) : (
+                      <ImageIcon size={18} />
+                    )}
+                  </button>
+                )}
+                <div className="jump-calendar-anchor" ref={jumpCalendarWrapRef}>
+                  <button
+                    className={`icon-btn jump-to-time-btn ${showJumpPopover ? 'active' : ''}`}
+                    onClick={handleToggleJumpPopover}
+                    title="跳转到指定时间"
+                  >
+                    <Calendar size={18} />
+                  </button>
+                </div>
+                {showJumpPopover && createPortal(
+                  <div
+                    ref={jumpPopoverPortalRef}
+                    style={{
+                      position: 'fixed',
+                      top: jumpPopoverPosition.top,
+                      left: jumpPopoverPosition.left,
+                      zIndex: 3600
+                    }}
+                  >
+                    <JumpToDatePopover
+                      isOpen={showJumpPopover}
+                      currentDate={jumpPopoverDate}
+                      onClose={() => setShowJumpPopover(false)}
+                      onSelect={handleJumpDateSelect}
+                      messageDates={messageDates}
+                      hasLoadedMessageDates={hasLoadedMessageDates}
+                      messageDateCounts={messageDateCounts}
+                      loadingDates={loadingDates}
+                      loadingDateCounts={loadingDateCounts}
+                      style={{ position: 'static', top: 'auto', right: 'auto' }}
+                    />
+                  </div>,
+                  document.body
+                )}
                 <button
                   className="icon-btn refresh-messages-btn"
                   onClick={handleRefreshMessages}
@@ -2311,11 +3873,18 @@ function ChatPage(_props: ChatPageProps) {
               </div>
             </div>
 
-            <div className={`message-content-wrapper ${hasInitialMessages ? 'loaded' : 'loading'}`}>
-              {isLoadingMessages && !hasInitialMessages && (
+            {isPreparingExportDialog && exportPrepareHint && (
+              <div className="export-prepare-hint" role="status" aria-live="polite">
+                <Loader2 size={14} className="spin" />
+                <span>{exportPrepareHint}</span>
+              </div>
+            )}
+
+            <div className={`message-content-wrapper ${hasInitialMessages ? 'loaded' : 'loading'} ${isSessionSwitching ? 'switching' : ''}`}>
+              {isLoadingMessages && (!hasInitialMessages || isSessionSwitching) && (
                 <div className="loading-messages loading-overlay">
                   <Loader2 size={24} />
-                  <span>加载消息中...</span>
+                  <span>{isSessionSwitching ? '切换会话中...' : '加载消息中...'}</span>
                 </div>
               )}
               <div
@@ -2368,7 +3937,7 @@ function ChatPage(_props: ChatPageProps) {
                         session={currentSession}
                         showTime={!showDateDivider && showTime}
                         myAvatarUrl={myAvatarUrl}
-                        isGroupChat={isGroupChat(currentSession.username)}
+                        isGroupChat={isGroupChatSession(currentSession.username)}
                         onRequireModelDownload={handleRequireModelDownload}
                         onContextMenu={handleContextMenu}
                         isSelectionMode={isSelectionMode}
@@ -2399,6 +3968,98 @@ function ChatPage(_props: ChatPageProps) {
                 </div>
               </div>
 
+              {/* 群成员面板 */}
+              {showGroupMembersPanel && isGroupChatSession(currentSession.username) && (
+                <div className="detail-panel group-members-panel">
+                  <div className="detail-header">
+                    <h4>群成员</h4>
+                    <button className="close-btn" onClick={() => setShowGroupMembersPanel(false)}>
+                      <X size={16} />
+                    </button>
+                  </div>
+
+                  <div className="group-members-toolbar">
+                    <span className="group-members-count">共 {groupPanelMembers.length} 人</span>
+                    <div className="group-members-search">
+                      <Search size={14} />
+                      <input
+                        type="text"
+                        value={groupMemberSearchKeyword}
+                        onChange={(event) => setGroupMemberSearchKeyword(event.target.value)}
+                        placeholder="搜索成员"
+                      />
+                    </div>
+                  </div>
+
+                  {isRefreshingGroupMembers && (
+                    <div className="group-members-status" role="status" aria-live="polite">
+                      <Loader2 size={14} className="spin" />
+                      <span>正在统计成员发言数...</span>
+                    </div>
+                  )}
+                  {groupMembersError && groupPanelMembers.length > 0 && (
+                    <div className="group-members-status warning" role="status" aria-live="polite">
+                      <span>{groupMembersError}</span>
+                    </div>
+                  )}
+
+                  {isLoadingGroupMembers ? (
+                    <div className="detail-loading">
+                      <Loader2 size={20} className="spin" />
+                      <span>{groupMembersLoadingHint || '加载群成员中...'}</span>
+                    </div>
+                  ) : groupMembersError && groupPanelMembers.length === 0 ? (
+                    <div className="detail-empty">{groupMembersError}</div>
+                  ) : filteredGroupPanelMembers.length === 0 ? (
+                    <div className="detail-empty">{groupMemberSearchKeyword.trim() ? '暂无匹配成员' : '暂无群成员数据'}</div>
+                  ) : (
+                    <div className="group-members-list">
+                      {filteredGroupPanelMembers.map((member) => (
+                        <div key={member.username} className="group-member-item">
+                          <div className="group-member-main">
+                            <Avatar
+                              src={member.avatarUrl}
+                              name={member.displayName || member.username}
+                              size={34}
+                              className="group-member-avatar"
+                            />
+                            <div className="group-member-meta">
+                              <div className="group-member-name-row">
+                                <span className="group-member-name" title={member.displayName || member.username}>
+                                  {member.displayName || member.username}
+                                </span>
+                                <div className="group-member-badges">
+                                  {member.isOwner && (
+                                    <span className="member-flag owner" title="群主">
+                                      <Crown size={12} />
+                                    </span>
+                                  )}
+                                  {member.isFriend && (
+                                    <span className="member-flag friend" title="好友">
+                                      <UserCheck size={12} />
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              <span className="group-member-id" title={member.alias || member.username}>
+                                {member.alias || member.username}
+                              </span>
+                            </div>
+                          </div>
+                          <span className={`group-member-count ${member.messageCountStatus}`}>
+                            {member.messageCountStatus === 'loading'
+                              ? '统计中'
+                              : member.messageCountStatus === 'failed'
+                                ? '统计失败'
+                                : `${member.messageCount.toLocaleString()} 条`}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* 会话详情面板 */}
               {showDetailPanel && (
                 <div className="detail-panel">
@@ -2408,7 +4069,7 @@ function ChatPage(_props: ChatPageProps) {
                       <X size={16} />
                     </button>
                   </div>
-                  {isLoadingDetail ? (
+                  {isLoadingDetail && !sessionDetail ? (
                     <div className="detail-loading">
                       <Loader2 size={20} className="spin" />
                       <span>加载中...</span>
@@ -2456,46 +4117,170 @@ function ChatPage(_props: ChatPageProps) {
                       <div className="detail-section">
                         <div className="section-title">
                           <MessageSquare size={14} />
-                          <span>消息统计</span>
+                          <span>消息统计（导出口径）</span>
+                        </div>
+                        <div className="detail-stats-meta">
+                          {isRefreshingDetailStats
+                            ? '统计刷新中...'
+                            : sessionDetail.statsUpdatedAt
+                              ? `${sessionDetail.statsStale ? '缓存于' : '更新于'} ${formatYmdHmDateTime(sessionDetail.statsUpdatedAt)}${sessionDetail.statsStale ? '（将后台刷新）' : ''}`
+                              : (isLoadingDetailExtra ? '统计加载中...' : '暂无统计缓存')}
                         </div>
                         <div className="detail-item">
                           <span className="label">消息总数</span>
                           <span className="value highlight">
                             {Number.isFinite(sessionDetail.messageCount)
                               ? sessionDetail.messageCount.toLocaleString()
-                              : '—'}
+                              : ((isLoadingDetail || isLoadingDetailExtra) ? '统计中...' : '—')}
                           </span>
                         </div>
-                        {sessionDetail.firstMessageTime && (
+                        <div className="detail-item">
+                          <span className="label">语音</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.voiceMessages)
+                              ? (sessionDetail.voiceMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="label">图片</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.imageMessages)
+                              ? (sessionDetail.imageMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="label">视频</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.videoMessages)
+                              ? (sessionDetail.videoMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="label">表情包</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.emojiMessages)
+                              ? (sessionDetail.emojiMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="label">转账消息数</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.transferMessages)
+                              ? (sessionDetail.transferMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="label">红包消息数</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.redPacketMessages)
+                              ? (sessionDetail.redPacketMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="label">通话消息数</span>
+                          <span className="value">
+                            {Number.isFinite(sessionDetail.callMessages)
+                              ? (sessionDetail.callMessages as number).toLocaleString()
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        {sessionDetail.wxid.includes('@chatroom') ? (
+                          <>
+                            <div className="detail-item">
+                              <span className="label">我发的消息数</span>
+                              <span className="value">
+                                {Number.isFinite(sessionDetail.groupMyMessages)
+                                  ? (sessionDetail.groupMyMessages as number).toLocaleString()
+                                  : (isLoadingDetailExtra ? '统计中...' : '—')}
+                              </span>
+                            </div>
+                            <div className="detail-item">
+                              <span className="label">群人数</span>
+                              <span className="value">
+                                {Number.isFinite(sessionDetail.groupMemberCount)
+                                  ? (sessionDetail.groupMemberCount as number).toLocaleString()
+                                  : (isLoadingDetailExtra ? '统计中...' : '—')}
+                              </span>
+                            </div>
+                            <div className="detail-item">
+                              <span className="label">群发言人数</span>
+                              <span className="value">
+                                {Number.isFinite(sessionDetail.groupActiveSpeakers)
+                                  ? (sessionDetail.groupActiveSpeakers as number).toLocaleString()
+                                  : (isLoadingDetailExtra ? '统计中...' : '—')}
+                              </span>
+                            </div>
+                            <div className="detail-item">
+                              <span className="label">群共同好友数</span>
+                              <span className="value">
+                                {sessionDetail.relationStatsLoaded
+                                  ? (Number.isFinite(sessionDetail.groupMutualFriends)
+                                    ? (sessionDetail.groupMutualFriends as number).toLocaleString()
+                                    : '—')
+                                  : (
+                                    <button
+                                      className="detail-inline-btn"
+                                      onClick={() => { void loadRelationStats() }}
+                                      disabled={isLoadingRelationStats || isLoadingDetailExtra}
+                                    >
+                                      {isLoadingRelationStats ? '加载中...' : '点击加载'}
+                                    </button>
+                                  )}
+                              </span>
+                            </div>
+                          </>
+                        ) : (
                           <div className="detail-item">
-                            <Calendar size={14} />
-                            <span className="label">首条消息</span>
+                            <span className="label">共同群聊数</span>
                             <span className="value">
-                              {Number.isFinite(sessionDetail.firstMessageTime)
-                                ? new Date(sessionDetail.firstMessageTime * 1000).toLocaleDateString('zh-CN')
-                                : '—'}
+                              {sessionDetail.relationStatsLoaded
+                                ? (Number.isFinite(sessionDetail.privateMutualGroups)
+                                  ? (sessionDetail.privateMutualGroups as number).toLocaleString()
+                                  : '—')
+                                : (
+                                  <button
+                                    className="detail-inline-btn"
+                                    onClick={() => { void loadRelationStats() }}
+                                    disabled={isLoadingRelationStats || isLoadingDetailExtra}
+                                  >
+                                    {isLoadingRelationStats ? '加载中...' : '点击加载'}
+                                  </button>
+                                )}
                             </span>
                           </div>
                         )}
-                        {sessionDetail.latestMessageTime && (
-                          <div className="detail-item">
-                            <Calendar size={14} />
-                            <span className="label">最新消息</span>
-                            <span className="value">
-                              {Number.isFinite(sessionDetail.latestMessageTime)
-                                ? new Date(sessionDetail.latestMessageTime * 1000).toLocaleDateString('zh-CN')
-                                : '—'}
-                            </span>
-                          </div>
-                        )}
+                        <div className="detail-item">
+                          <Calendar size={14} />
+                          <span className="label">首条消息</span>
+                          <span className="value">
+                            {sessionDetail.firstMessageTime
+                              ? formatYmdDateFromSeconds(sessionDetail.firstMessageTime)
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <Calendar size={14} />
+                          <span className="label">最新消息</span>
+                          <span className="value">
+                            {sessionDetail.latestMessageTime
+                              ? formatYmdDateFromSeconds(sessionDetail.latestMessageTime)
+                              : (isLoadingDetailExtra ? '统计中...' : '—')}
+                          </span>
+                        </div>
                       </div>
 
-                      {Array.isArray(sessionDetail.messageTables) && sessionDetail.messageTables.length > 0 && (
-                        <div className="detail-section">
-                          <div className="section-title">
-                            <Database size={14} />
-                            <span>数据库分布</span>
-                          </div>
+                      <div className="detail-section">
+                        <div className="section-title">
+                          <Database size={14} />
+                          <span>数据库分布</span>
+                        </div>
+                        {Array.isArray(sessionDetail.messageTables) && sessionDetail.messageTables.length > 0 ? (
                           <div className="table-list">
                             {sessionDetail.messageTables.map((t, i) => (
                               <div key={i} className="table-item">
@@ -2504,8 +4289,12 @@ function ChatPage(_props: ChatPageProps) {
                               </div>
                             ))}
                           </div>
-                        </div>
-                      )}
+                        ) : (
+                          <div className="detail-table-placeholder">
+                            {isLoadingDetailExtra ? '统计中...' : '暂无统计数据'}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   ) : (
                     <div className="detail-empty">暂无详情</div>
@@ -2517,7 +4306,8 @@ function ChatPage(_props: ChatPageProps) {
         ) : (
           <div className="empty-chat">
             <MessageSquare />
-            <p>选择一个会话开始查看聊天记录</p>
+            <p>{standaloneSessionWindow ? '会话加载中或暂无会话记录' : '选择一个会话开始查看聊天记录'}</p>
+            {standaloneSessionWindow && connectionError && <p className="hint">{connectionError}</p>}
           </div>
         )}
       </div>

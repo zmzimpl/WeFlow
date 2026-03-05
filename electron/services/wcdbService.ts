@@ -218,6 +218,10 @@ export class WcdbService {
     return this.callWorker('getMessageCount', { sessionId })
   }
 
+  async getMessageCounts(sessionIds: string[]): Promise<{ success: boolean; counts?: Record<string, number>; error?: string }> {
+    return this.callWorker('getMessageCounts', { sessionIds })
+  }
+
   /**
    * 获取联系人昵称
    */

@@ -30,7 +30,7 @@ interface GroupMessageRank {
 }
 
 type AnalysisFunction = 'members' | 'memberExport' | 'ranking' | 'activeHours' | 'mediaStats'
-type MemberExportFormat = 'chatlab' | 'chatlab-jsonl' | 'json' | 'html' | 'txt' | 'excel' | 'weclone'
+type MemberExportFormat = 'chatlab' | 'chatlab-jsonl' | 'json' | 'arkme-json' | 'html' | 'txt' | 'excel' | 'weclone'
 
 interface MemberMessageExportOptions {
   format: MemberExportFormat
@@ -119,6 +119,7 @@ function GroupAnalyticsPage() {
     { value: 'excel', label: 'Excel', desc: '电子表格，适合统计分析' },
     { value: 'txt', label: 'TXT', desc: '纯文本，通用格式' },
     { value: 'json', label: 'JSON', desc: '详细格式，包含完整消息信息' },
+    { value: 'arkme-json', label: 'Arkme JSON', desc: '紧凑 JSON，支持 sender 去重与关系统计' },
     { value: 'chatlab', label: 'ChatLab', desc: '标准格式，支持其他软件导入' },
     { value: 'chatlab-jsonl', label: 'ChatLab JSONL', desc: '流式格式，适合大量消息' },
     { value: 'html', label: 'HTML', desc: '网页格式，可直接浏览' },

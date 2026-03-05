@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, type UIEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, RefreshCw, X, User, Users, MessageSquare, Loader2, FolderOpen, Download, ChevronDown, MessageCircle, UserX } from 'lucide-react'
+import { Search, RefreshCw, X, User, Users, MessageSquare, Loader2, FolderOpen, Download, ChevronDown, MessageCircle, UserX, AlertTriangle, ClipboardList } from 'lucide-react'
 import { useChatStore } from '../stores/chatStore'
+import { toContactTypeCardCounts, useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
+import * as configService from '../services/config'
 import './ContactsPage.scss'
 
 interface ContactInfo {
@@ -13,12 +15,43 @@ interface ContactInfo {
     type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
 
+interface ContactEnrichInfo {
+    displayName?: string
+    avatarUrl?: string
+}
+
+const AVATAR_ENRICH_BATCH_SIZE = 80
+const SEARCH_DEBOUNCE_MS = 120
+const VIRTUAL_ROW_HEIGHT = 76
+const VIRTUAL_OVERSCAN = 10
+const DEFAULT_CONTACTS_LOAD_TIMEOUT_MS = 3000
+const AVATAR_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+interface ContactsLoadSession {
+    requestId: string
+    startedAt: number
+    attempt: number
+    timeoutMs: number
+}
+
+interface ContactsLoadIssue {
+    kind: 'timeout' | 'error'
+    title: string
+    message: string
+    reason: string
+    errorDetail?: string
+    occurredAt: number
+    elapsedMs: number
+}
+
+type ContactsDataSource = 'cache' | 'network' | null
+
 function ContactsPage() {
     const [contacts, setContacts] = useState<ContactInfo[]>([])
-    const [filteredContacts, setFilteredContacts] = useState<ContactInfo[]>([])
     const [selectedUsernames, setSelectedUsernames] = useState<Set<string>>(new Set())
     const [isLoading, setIsLoading] = useState(true)
     const [searchKeyword, setSearchKeyword] = useState('')
+    const [debouncedSearchKeyword, setDebouncedSearchKeyword] = useState('')
     const [contactTypes, setContactTypes] = useState({
         friends: true,
         groups: false,
@@ -39,79 +72,495 @@ function ContactsPage() {
     const [isExporting, setIsExporting] = useState(false)
     const [showFormatSelect, setShowFormatSelect] = useState(false)
     const formatDropdownRef = useRef<HTMLDivElement>(null)
+    const listRef = useRef<HTMLDivElement>(null)
+    const loadVersionRef = useRef(0)
+    const [avatarEnrichProgress, setAvatarEnrichProgress] = useState({
+        loaded: 0,
+        total: 0,
+        running: false
+    })
+    const [scrollTop, setScrollTop] = useState(0)
+    const [listViewportHeight, setListViewportHeight] = useState(480)
+    const sharedTabCounts = useContactTypeCountsStore(state => state.tabCounts)
+    const syncContactTypeCounts = useContactTypeCountsStore(state => state.syncFromContacts)
+    const loadAttemptRef = useRef(0)
+    const loadTimeoutTimerRef = useRef<number | null>(null)
+    const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
+    const [loadSession, setLoadSession] = useState<ContactsLoadSession | null>(null)
+    const [loadIssue, setLoadIssue] = useState<ContactsLoadIssue | null>(null)
+    const [showDiagnostics, setShowDiagnostics] = useState(false)
+    const [diagnosticTick, setDiagnosticTick] = useState(Date.now())
+    const [contactsDataSource, setContactsDataSource] = useState<ContactsDataSource>(null)
+    const [contactsUpdatedAt, setContactsUpdatedAt] = useState<number | null>(null)
+    const [avatarCacheUpdatedAt, setAvatarCacheUpdatedAt] = useState<number | null>(null)
+    const contactsLoadTimeoutMsRef = useRef(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
+    const contactsCacheScopeRef = useRef('default')
+    const contactsAvatarCacheRef = useRef<Record<string, configService.ContactsAvatarCacheEntry>>({})
 
-    // 加载通讯录
-    const loadContacts = useCallback(async () => {
-        setIsLoading(true)
-        try {
-            const result = await window.electronAPI.chat.connect()
-            if (!result.success) {
-                console.error('连接失败:', result.error)
-                setIsLoading(false)
-                return
-            }
-            const contactsResult = await window.electronAPI.chat.getContacts()
-            
-            if (contactsResult.success && contactsResult.contacts) {
-                
-                
+    const ensureContactsCacheScope = useCallback(async () => {
+        if (contactsCacheScopeRef.current !== 'default') {
+            return contactsCacheScopeRef.current
+        }
+        const [dbPath, myWxid] = await Promise.all([
+            configService.getDbPath(),
+            configService.getMyWxid()
+        ])
+        const scopeKey = dbPath || myWxid
+            ? `${dbPath || ''}::${myWxid || ''}`
+            : 'default'
+        contactsCacheScopeRef.current = scopeKey
+        return scopeKey
+    }, [])
 
-                // 获取头像URL
-                const usernames = contactsResult.contacts.map((c: ContactInfo) => c.username)
-                if (usernames.length > 0) {
-                    const avatarResult = await window.electronAPI.chat.enrichSessionsContactInfo(usernames)
-                    if (avatarResult.success && avatarResult.contacts) {
-                        contactsResult.contacts.forEach((contact: ContactInfo) => {
-                            const enriched = avatarResult.contacts?.[contact.username]
-                            if (enriched?.avatarUrl) {
-                                contact.avatarUrl = enriched.avatarUrl
-                            }
-                        })
-                    }
+    useEffect(() => {
+        let cancelled = false
+        void (async () => {
+            try {
+                const value = await configService.getContactsLoadTimeoutMs()
+                if (!cancelled) {
+                    setContactsLoadTimeoutMs(value)
                 }
-
-                setContacts(contactsResult.contacts)
-                setFilteredContacts(contactsResult.contacts)
-                setSelectedUsernames(new Set())
+            } catch (error) {
+                console.error('读取通讯录超时配置失败:', error)
             }
-        } catch (e) {
-            console.error('加载通讯录失败:', e)
-        } finally {
-            setIsLoading(false)
+        })()
+        return () => {
+            cancelled = true
         }
     }, [])
 
     useEffect(() => {
-        loadContacts()
-    }, [loadContacts])
+        contactsLoadTimeoutMsRef.current = contactsLoadTimeoutMs
+    }, [contactsLoadTimeoutMs])
 
-    // 搜索和类型过滤
+    const mergeAvatarCacheIntoContacts = useCallback((sourceContacts: ContactInfo[]): ContactInfo[] => {
+        const avatarCache = contactsAvatarCacheRef.current
+        if (!sourceContacts.length || Object.keys(avatarCache).length === 0) {
+            return sourceContacts
+        }
+        let changed = false
+        const merged = sourceContacts.map((contact) => {
+            const cachedAvatar = avatarCache[contact.username]?.avatarUrl
+            if (!cachedAvatar || contact.avatarUrl) {
+                return contact
+            }
+            changed = true
+            return {
+                ...contact,
+                avatarUrl: cachedAvatar
+            }
+        })
+        return changed ? merged : sourceContacts
+    }, [])
+
+    const upsertAvatarCacheFromContacts = useCallback((
+        scopeKey: string,
+        sourceContacts: ContactInfo[],
+        options?: { prune?: boolean; markCheckedUsernames?: string[] }
+    ) => {
+        if (!scopeKey) return
+        const nextCache = { ...contactsAvatarCacheRef.current }
+        const now = Date.now()
+        const markCheckedSet = new Set((options?.markCheckedUsernames || []).filter(Boolean))
+        const usernamesInSource = new Set<string>()
+        let changed = false
+
+        for (const contact of sourceContacts) {
+            const username = String(contact.username || '').trim()
+            if (!username) continue
+            usernamesInSource.add(username)
+            const prev = nextCache[username]
+            const avatarUrl = String(contact.avatarUrl || '').trim()
+            if (!avatarUrl) continue
+            const updatedAt = !prev || prev.avatarUrl !== avatarUrl ? now : prev.updatedAt
+            const checkedAt = markCheckedSet.has(username) ? now : (prev?.checkedAt || now)
+            if (!prev || prev.avatarUrl !== avatarUrl || prev.updatedAt !== updatedAt || prev.checkedAt !== checkedAt) {
+                nextCache[username] = {
+                    avatarUrl,
+                    updatedAt,
+                    checkedAt
+                }
+                changed = true
+            }
+        }
+
+        for (const username of markCheckedSet) {
+            const prev = nextCache[username]
+            if (!prev) continue
+            if (prev.checkedAt !== now) {
+                nextCache[username] = {
+                    ...prev,
+                    checkedAt: now
+                }
+                changed = true
+            }
+        }
+
+        if (options?.prune) {
+            for (const username of Object.keys(nextCache)) {
+                if (usernamesInSource.has(username)) continue
+                delete nextCache[username]
+                changed = true
+            }
+        }
+
+        if (!changed) return
+        contactsAvatarCacheRef.current = nextCache
+        setAvatarCacheUpdatedAt(now)
+        void configService.setContactsAvatarCache(scopeKey, nextCache).catch((error) => {
+            console.error('写入通讯录头像缓存失败:', error)
+        })
+    }, [])
+
+    const applyEnrichedContacts = useCallback((enrichedMap: Record<string, ContactEnrichInfo>) => {
+        if (!enrichedMap || Object.keys(enrichedMap).length === 0) return
+
+        setContacts(prev => {
+            let changed = false
+            const next = prev.map(contact => {
+                const enriched = enrichedMap[contact.username]
+                if (!enriched) return contact
+                const displayName = enriched.displayName || contact.displayName
+                const avatarUrl = enriched.avatarUrl || contact.avatarUrl
+                if (displayName === contact.displayName && avatarUrl === contact.avatarUrl) {
+                    return contact
+                }
+                changed = true
+                return {
+                    ...contact,
+                    displayName,
+                    avatarUrl
+                }
+            })
+            return changed ? next : prev
+        })
+
+        setSelectedContact(prev => {
+            if (!prev) return prev
+            const enriched = enrichedMap[prev.username]
+            if (!enriched) return prev
+            const displayName = enriched.displayName || prev.displayName
+            const avatarUrl = enriched.avatarUrl || prev.avatarUrl
+            if (displayName === prev.displayName && avatarUrl === prev.avatarUrl) {
+                return prev
+            }
+            return {
+                ...prev,
+                displayName,
+                avatarUrl
+            }
+        })
+    }, [])
+
+    const enrichContactsInBackground = useCallback(async (
+        sourceContacts: ContactInfo[],
+        loadVersion: number,
+        scopeKey: string
+    ) => {
+        const sourceByUsername = new Map<string, ContactInfo>()
+        for (const contact of sourceContacts) {
+            if (!contact.username) continue
+            sourceByUsername.set(contact.username, contact)
+        }
+        const now = Date.now()
+        const usernames = sourceContacts
+            .map(contact => contact.username)
+            .filter(Boolean)
+            .filter((username) => {
+                const currentContact = sourceByUsername.get(username)
+                if (!currentContact) return false
+                const cacheEntry = contactsAvatarCacheRef.current[username]
+                if (!cacheEntry || !cacheEntry.avatarUrl) {
+                    return !currentContact.avatarUrl
+                }
+                if (currentContact.avatarUrl && currentContact.avatarUrl !== cacheEntry.avatarUrl) {
+                    return true
+                }
+                const checkedAt = cacheEntry.checkedAt || 0
+                return now - checkedAt >= AVATAR_RECHECK_INTERVAL_MS
+            })
+
+        const total = usernames.length
+        setAvatarEnrichProgress({
+            loaded: 0,
+            total,
+            running: total > 0
+        })
+        if (total === 0) return
+
+        for (let i = 0; i < total; i += AVATAR_ENRICH_BATCH_SIZE) {
+            if (loadVersionRef.current !== loadVersion) return
+            const batch = usernames.slice(i, i + AVATAR_ENRICH_BATCH_SIZE)
+            if (batch.length === 0) continue
+
+            try {
+                const avatarResult = await window.electronAPI.chat.enrichSessionsContactInfo(batch)
+                if (loadVersionRef.current !== loadVersion) return
+                if (avatarResult.success && avatarResult.contacts) {
+                    applyEnrichedContacts(avatarResult.contacts)
+                    for (const [username, enriched] of Object.entries(avatarResult.contacts)) {
+                        const prev = sourceByUsername.get(username)
+                        if (!prev) continue
+                        sourceByUsername.set(username, {
+                            ...prev,
+                            displayName: enriched.displayName || prev.displayName,
+                            avatarUrl: enriched.avatarUrl || prev.avatarUrl
+                        })
+                    }
+                }
+                const batchContacts = batch
+                    .map(username => sourceByUsername.get(username))
+                    .filter((contact): contact is ContactInfo => Boolean(contact))
+                upsertAvatarCacheFromContacts(scopeKey, batchContacts, {
+                    markCheckedUsernames: batch
+                })
+            } catch (e) {
+                console.error('分批补全头像失败:', e)
+            }
+
+            const loaded = Math.min(i + batch.length, total)
+            setAvatarEnrichProgress({
+                loaded,
+                total,
+                running: loaded < total
+            })
+
+            await new Promise(resolve => setTimeout(resolve, 0))
+        }
+    }, [applyEnrichedContacts, upsertAvatarCacheFromContacts])
+
+    // 加载通讯录
+    const loadContacts = useCallback(async (options?: { scopeKey?: string }) => {
+        const scopeKey = options?.scopeKey || await ensureContactsCacheScope()
+        const loadVersion = loadVersionRef.current + 1
+        loadVersionRef.current = loadVersion
+        loadAttemptRef.current += 1
+        const startedAt = Date.now()
+        const timeoutMs = contactsLoadTimeoutMsRef.current
+        const requestId = `contacts-${startedAt}-${loadAttemptRef.current}`
+        setLoadSession({
+            requestId,
+            startedAt,
+            attempt: loadAttemptRef.current,
+            timeoutMs
+        })
+        setLoadIssue(null)
+        setShowDiagnostics(false)
+        if (loadTimeoutTimerRef.current) {
+            window.clearTimeout(loadTimeoutTimerRef.current)
+            loadTimeoutTimerRef.current = null
+        }
+        const timeoutTimerId = window.setTimeout(() => {
+            if (loadVersionRef.current !== loadVersion) return
+            const elapsedMs = Date.now() - startedAt
+            setLoadIssue({
+                kind: 'timeout',
+                title: '通讯录加载超时',
+                message: `等待超过 ${timeoutMs}ms，联系人列表仍未返回。`,
+                reason: 'chat.getContacts 长时间未返回，可能是数据库查询繁忙或连接异常。',
+                occurredAt: Date.now(),
+                elapsedMs
+            })
+        }, timeoutMs)
+        loadTimeoutTimerRef.current = timeoutTimerId
+
+        setIsLoading(true)
+        setAvatarEnrichProgress({
+            loaded: 0,
+            total: 0,
+            running: false
+        })
+        try {
+            const contactsResult = await window.electronAPI.chat.getContacts()
+
+            if (loadVersionRef.current !== loadVersion) return
+            if (contactsResult.success && contactsResult.contacts) {
+                if (loadTimeoutTimerRef.current === timeoutTimerId) {
+                    window.clearTimeout(loadTimeoutTimerRef.current)
+                    loadTimeoutTimerRef.current = null
+                }
+                const contactsWithAvatarCache = mergeAvatarCacheIntoContacts(contactsResult.contacts)
+                setContacts(contactsWithAvatarCache)
+                syncContactTypeCounts(contactsWithAvatarCache)
+                setSelectedUsernames(new Set())
+                setSelectedContact(prev => {
+                    if (!prev) return prev
+                    return contactsWithAvatarCache.find(contact => contact.username === prev.username) || null
+                })
+                const now = Date.now()
+                setContactsDataSource('network')
+                setContactsUpdatedAt(now)
+                setLoadIssue(null)
+                setIsLoading(false)
+                upsertAvatarCacheFromContacts(scopeKey, contactsWithAvatarCache, { prune: true })
+                void configService.setContactsListCache(
+                    scopeKey,
+                    contactsWithAvatarCache.map(contact => ({
+                        username: contact.username,
+                        displayName: contact.displayName,
+                        remark: contact.remark,
+                        nickname: contact.nickname,
+                        type: contact.type
+                    }))
+                ).catch((error) => {
+                    console.error('写入通讯录缓存失败:', error)
+                })
+                void enrichContactsInBackground(contactsWithAvatarCache, loadVersion, scopeKey)
+                return
+            }
+            const elapsedMs = Date.now() - startedAt
+            setLoadIssue({
+                kind: 'error',
+                title: '通讯录加载失败',
+                message: '联系人接口返回失败，未拿到联系人列表。',
+                reason: 'chat.getContacts 返回 success=false。',
+                errorDetail: contactsResult.error || '未知错误',
+                occurredAt: Date.now(),
+                elapsedMs
+            })
+        } catch (e) {
+            console.error('加载通讯录失败:', e)
+            const elapsedMs = Date.now() - startedAt
+            setLoadIssue({
+                kind: 'error',
+                title: '通讯录加载失败',
+                message: '联系人请求执行异常。',
+                reason: '调用 chat.getContacts 发生异常。',
+                errorDetail: String(e),
+                occurredAt: Date.now(),
+                elapsedMs
+            })
+        } finally {
+            if (loadTimeoutTimerRef.current === timeoutTimerId) {
+                window.clearTimeout(loadTimeoutTimerRef.current)
+                loadTimeoutTimerRef.current = null
+            }
+            if (loadVersionRef.current === loadVersion) {
+                setIsLoading(false)
+            }
+        }
+    }, [
+        ensureContactsCacheScope,
+        enrichContactsInBackground,
+        mergeAvatarCacheIntoContacts,
+        syncContactTypeCounts,
+        upsertAvatarCacheFromContacts
+    ])
+
     useEffect(() => {
-        let filtered = contacts
+        let cancelled = false
+        void (async () => {
+            const scopeKey = await ensureContactsCacheScope()
+            if (cancelled) return
+            try {
+                const [cacheItem, avatarCacheItem] = await Promise.all([
+                    configService.getContactsListCache(scopeKey),
+                    configService.getContactsAvatarCache(scopeKey)
+                ])
+                const avatarCacheMap = avatarCacheItem?.avatars || {}
+                contactsAvatarCacheRef.current = avatarCacheMap
+                setAvatarCacheUpdatedAt(avatarCacheItem?.updatedAt || null)
+                if (!cancelled && cacheItem && Array.isArray(cacheItem.contacts) && cacheItem.contacts.length > 0) {
+                    const cachedContacts: ContactInfo[] = cacheItem.contacts.map(contact => ({
+                        ...contact,
+                        avatarUrl: avatarCacheMap[contact.username]?.avatarUrl
+                    }))
+                    setContacts(cachedContacts)
+                    syncContactTypeCounts(cachedContacts)
+                    setContactsDataSource('cache')
+                    setContactsUpdatedAt(cacheItem.updatedAt || null)
+                    setIsLoading(false)
+                }
+            } catch (error) {
+                console.error('读取通讯录缓存失败:', error)
+            }
+            if (!cancelled) {
+                void loadContacts({ scopeKey })
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [ensureContactsCacheScope, loadContacts, syncContactTypeCounts])
 
-        // 类型过滤
-        filtered = filtered.filter(c => {
-            if (c.type === 'friend' && !contactTypes.friends) return false
-            if (c.type === 'group' && !contactTypes.groups) return false
-            if (c.type === 'official' && !contactTypes.officials) return false
-            if (c.type === 'former_friend' && !contactTypes.deletedFriends) return false
+    useEffect(() => {
+        return () => {
+            if (loadTimeoutTimerRef.current) {
+                window.clearTimeout(loadTimeoutTimerRef.current)
+                loadTimeoutTimerRef.current = null
+            }
+            loadVersionRef.current += 1
+        }
+    }, [])
+
+    useEffect(() => {
+        if (!loadIssue || contacts.length > 0) return
+        if (!(isLoading && loadIssue.kind === 'timeout')) return
+        const timer = window.setInterval(() => {
+            setDiagnosticTick(Date.now())
+        }, 500)
+        return () => window.clearInterval(timer)
+    }, [contacts.length, isLoading, loadIssue])
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => {
+            setDebouncedSearchKeyword(searchKeyword.trim().toLowerCase())
+        }, SEARCH_DEBOUNCE_MS)
+        return () => window.clearTimeout(timer)
+    }, [searchKeyword])
+
+    const filteredContacts = useMemo(() => {
+        let filtered = contacts.filter(contact => {
+            if (contact.type === 'friend' && !contactTypes.friends) return false
+            if (contact.type === 'group' && !contactTypes.groups) return false
+            if (contact.type === 'official' && !contactTypes.officials) return false
+            if (contact.type === 'former_friend' && !contactTypes.deletedFriends) return false
             return true
         })
 
-        // 关键词过滤
-        if (searchKeyword.trim()) {
-            const lower = searchKeyword.toLowerCase()
-            filtered = filtered.filter(c =>
-                c.displayName?.toLowerCase().includes(lower) ||
-                c.remark?.toLowerCase().includes(lower) ||
-                c.username.toLowerCase().includes(lower)
+        if (debouncedSearchKeyword) {
+            filtered = filtered.filter(contact =>
+                contact.displayName?.toLowerCase().includes(debouncedSearchKeyword) ||
+                contact.remark?.toLowerCase().includes(debouncedSearchKeyword) ||
+                contact.username.toLowerCase().includes(debouncedSearchKeyword)
             )
         }
 
-        setFilteredContacts(filtered)
-    }, [searchKeyword, contacts, contactTypes])
+        return filtered
+    }, [contacts, contactTypes, debouncedSearchKeyword])
 
-    // 点击外部关闭下拉菜单
+    const contactTypeCounts = useMemo(() => toContactTypeCardCounts(sharedTabCounts), [sharedTabCounts])
+
+    useEffect(() => {
+        if (!listRef.current) return
+        listRef.current.scrollTop = 0
+        setScrollTop(0)
+    }, [debouncedSearchKeyword, contactTypes])
+
+    useEffect(() => {
+        const node = listRef.current
+        if (!node) return
+
+        const updateViewportHeight = () => {
+            setListViewportHeight(Math.max(node.clientHeight, VIRTUAL_ROW_HEIGHT))
+        }
+        updateViewportHeight()
+
+        const observer = new ResizeObserver(() => updateViewportHeight())
+        observer.observe(node)
+        return () => observer.disconnect()
+    }, [filteredContacts.length, isLoading])
+
+    useEffect(() => {
+        const maxScroll = Math.max(0, filteredContacts.length * VIRTUAL_ROW_HEIGHT - listViewportHeight)
+        if (scrollTop <= maxScroll) return
+        setScrollTop(maxScroll)
+        if (listRef.current) {
+            listRef.current.scrollTop = maxScroll
+        }
+    }, [filteredContacts.length, listViewportHeight, scrollTop])
+
+    // 搜索和类型过滤
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
             const target = event.target as Node
@@ -123,10 +572,84 @@ function ContactsPage() {
         return () => document.removeEventListener('mousedown', handleClickOutside)
     }, [showFormatSelect])
 
-    const selectedInFilteredCount = filteredContacts.reduce((count, contact) => {
-        return selectedUsernames.has(contact.username) ? count + 1 : count
-    }, 0)
+    const selectedInFilteredCount = useMemo(() => {
+        return filteredContacts.reduce((count, contact) => {
+            return selectedUsernames.has(contact.username) ? count + 1 : count
+        }, 0)
+    }, [filteredContacts, selectedUsernames])
     const allFilteredSelected = filteredContacts.length > 0 && selectedInFilteredCount === filteredContacts.length
+
+    const { startIndex, endIndex } = useMemo(() => {
+        if (filteredContacts.length === 0) {
+            return { startIndex: 0, endIndex: 0 }
+        }
+        const baseStart = Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT)
+        const visibleCount = Math.ceil(listViewportHeight / VIRTUAL_ROW_HEIGHT)
+        const nextStart = Math.max(0, baseStart - VIRTUAL_OVERSCAN)
+        const nextEnd = Math.min(filteredContacts.length, nextStart + visibleCount + VIRTUAL_OVERSCAN * 2)
+        return {
+            startIndex: nextStart,
+            endIndex: nextEnd
+        }
+    }, [filteredContacts.length, listViewportHeight, scrollTop])
+
+    const visibleContacts = useMemo(() => {
+        return filteredContacts.slice(startIndex, endIndex)
+    }, [filteredContacts, startIndex, endIndex])
+
+    const onContactsListScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+        setScrollTop(event.currentTarget.scrollTop)
+    }, [])
+
+    const issueElapsedMs = useMemo(() => {
+        if (!loadIssue) return 0
+        if (isLoading && loadSession) {
+            return Math.max(loadIssue.elapsedMs, diagnosticTick - loadSession.startedAt)
+        }
+        return loadIssue.elapsedMs
+    }, [diagnosticTick, isLoading, loadIssue, loadSession])
+
+    const diagnosticsText = useMemo(() => {
+        if (!loadIssue || !loadSession) return ''
+        return [
+            `请求ID: ${loadSession.requestId}`,
+            `请求序号: 第 ${loadSession.attempt} 次`,
+            `阈值配置: ${loadSession.timeoutMs}ms`,
+            `当前状态: ${loadIssue.kind === 'timeout' ? '超时等待中' : '请求失败'}`,
+            `累计耗时: ${(issueElapsedMs / 1000).toFixed(1)}s`,
+            `发生时间: ${new Date(loadIssue.occurredAt).toLocaleString()}`,
+            `阶段: chat.getContacts`,
+            `原因: ${loadIssue.reason}`,
+            `错误详情: ${loadIssue.errorDetail || '无'}`
+        ].join('\n')
+    }, [issueElapsedMs, loadIssue, loadSession])
+
+    const copyDiagnostics = useCallback(async () => {
+        if (!diagnosticsText) return
+        try {
+            await navigator.clipboard.writeText(diagnosticsText)
+            alert('诊断信息已复制')
+        } catch (error) {
+            console.error('复制诊断信息失败:', error)
+            alert('复制失败，请手动复制诊断信息')
+        }
+    }, [diagnosticsText])
+
+    const contactsUpdatedAtLabel = useMemo(() => {
+        if (!contactsUpdatedAt) return ''
+        return new Date(contactsUpdatedAt).toLocaleString()
+    }, [contactsUpdatedAt])
+
+    const avatarCachedCount = useMemo(() => {
+        return contacts.reduce((count, contact) => (
+            contact.avatarUrl ? count + 1 : count
+        ), 0)
+    }, [contacts])
+
+    const avatarCacheUpdatedAtLabel = useMemo(() => {
+        if (!avatarCacheUpdatedAt) return ''
+        return new Date(avatarCacheUpdatedAt).toLocaleString()
+    }, [avatarCacheUpdatedAt])
 
     const toggleContactSelected = (username: string, checked: boolean) => {
         setSelectedUsernames(prev => {
@@ -256,7 +779,7 @@ function ContactsPage() {
                         >
                             <Download size={18} />
                         </button>
-                        <button className="icon-btn" onClick={loadContacts} disabled={isLoading}>
+                        <button className="icon-btn" onClick={() => void loadContacts()} disabled={isLoading}>
                             <RefreshCw size={18} className={isLoading ? 'spin' : ''} />
                         </button>
                     </div>
@@ -280,24 +803,51 @@ function ContactsPage() {
                 <div className="type-filters">
                     <label className={`filter-chip ${contactTypes.friends ? 'active' : ''}`}>
                         <input type="checkbox" checked={contactTypes.friends} onChange={e => setContactTypes({ ...contactTypes, friends: e.target.checked })} />
-                        <User size={16} /><span>好友</span>
+                        <User size={16} />
+                        <span className="chip-label">好友</span>
+                        <span className="chip-count">{contactTypeCounts.friends}</span>
                     </label>
                     <label className={`filter-chip ${contactTypes.groups ? 'active' : ''}`}>
                         <input type="checkbox" checked={contactTypes.groups} onChange={e => setContactTypes({ ...contactTypes, groups: e.target.checked })} />
-                        <Users size={16} /><span>群聊</span>
+                        <Users size={16} />
+                        <span className="chip-label">群聊</span>
+                        <span className="chip-count">{contactTypeCounts.groups}</span>
                     </label>
                     <label className={`filter-chip ${contactTypes.officials ? 'active' : ''}`}>
                         <input type="checkbox" checked={contactTypes.officials} onChange={e => setContactTypes({ ...contactTypes, officials: e.target.checked })} />
-                        <MessageSquare size={16} /><span>公众号</span>
+                        <MessageSquare size={16} />
+                        <span className="chip-label">公众号</span>
+                        <span className="chip-count">{contactTypeCounts.officials}</span>
                     </label>
                     <label className={`filter-chip ${contactTypes.deletedFriends ? 'active' : ''}`}>
                         <input type="checkbox" checked={contactTypes.deletedFriends} onChange={e => setContactTypes({ ...contactTypes, deletedFriends: e.target.checked })} />
-                        <UserX size={16} /><span>曾经的好友</span>
+                        <UserX size={16} />
+                        <span className="chip-label">曾经的好友</span>
+                        <span className="chip-count">{contactTypeCounts.deletedFriends}</span>
                     </label>
                 </div>
 
                 <div className="contacts-count">
-                    共 {filteredContacts.length} 个联系人
+                    共 {filteredContacts.length} / {contacts.length} 个联系人
+                    {contactsUpdatedAt && (
+                        <span className="contacts-cache-meta">
+                            {contactsDataSource === 'cache' ? '缓存' : '最新'} · 更新于 {contactsUpdatedAtLabel}
+                        </span>
+                    )}
+                    {contacts.length > 0 && (
+                        <span className="contacts-cache-meta">
+                            头像缓存 {avatarCachedCount}/{contacts.length}
+                            {avatarCacheUpdatedAtLabel ? ` · 更新于 ${avatarCacheUpdatedAtLabel}` : ''}
+                        </span>
+                    )}
+                    {isLoading && contacts.length > 0 && (
+                        <span className="contacts-cache-meta syncing">后台同步中...</span>
+                    )}
+                    {avatarEnrichProgress.running && (
+                        <span className="avatar-enrich-progress">
+                            头像补全中 {avatarEnrichProgress.loaded}/{avatarEnrichProgress.total}
+                        </span>
+                    )}
                 </div>
 
                 {exportMode && (
@@ -315,61 +865,105 @@ function ContactsPage() {
                     </div>
                 )}
 
-                {isLoading ? (
+                {contacts.length === 0 && loadIssue ? (
+                    <div className="load-issue-state">
+                        <div className="issue-card">
+                            <div className="issue-title">
+                                <AlertTriangle size={18} />
+                                <span>{loadIssue.title}</span>
+                            </div>
+                            <p className="issue-message">{loadIssue.message}</p>
+                            <p className="issue-reason">{loadIssue.reason}</p>
+                            <ul className="issue-hints">
+                                <li>可能原因1：数据库当前仍在执行高开销查询（例如导出页后台统计）。</li>
+                                <li>可能原因2：contact.db 数据量较大，首次查询时间过长。</li>
+                                <li>可能原因3：数据库连接状态异常或 IPC 调用卡住。</li>
+                            </ul>
+                            <div className="issue-actions">
+                                <button className="issue-btn primary" onClick={() => void loadContacts()}>
+                                    <RefreshCw size={14} />
+                                    <span>重试加载</span>
+                                </button>
+                                <button className="issue-btn" onClick={() => setShowDiagnostics(prev => !prev)}>
+                                    <ClipboardList size={14} />
+                                    <span>{showDiagnostics ? '收起诊断详情' : '查看诊断详情'}</span>
+                                </button>
+                                <button className="issue-btn" onClick={copyDiagnostics}>
+                                    <span>复制诊断信息</span>
+                                </button>
+                            </div>
+                            {showDiagnostics && (
+                                <pre className="issue-diagnostics">{diagnosticsText}</pre>
+                            )}
+                        </div>
+                    </div>
+                ) : isLoading && contacts.length === 0 ? (
                     <div className="loading-state">
                         <Loader2 size={32} className="spin" />
-                        <span>加载中...</span>
+                        <span>联系人加载中...</span>
                     </div>
                 ) : filteredContacts.length === 0 ? (
                     <div className="empty-state">
                         <span>暂无联系人</span>
                     </div>
                 ) : (
-                    <div className="contacts-list">
-                        {filteredContacts.map(contact => {
+                    <div className="contacts-list" ref={listRef} onScroll={onContactsListScroll}>
+                        <div
+                            className="contacts-list-virtual"
+                            style={{ height: filteredContacts.length * VIRTUAL_ROW_HEIGHT }}
+                        >
+                            {visibleContacts.map((contact, idx) => {
+                            const absoluteIndex = startIndex + idx
+                            const top = absoluteIndex * VIRTUAL_ROW_HEIGHT
                             const isChecked = selectedUsernames.has(contact.username)
                             const isActive = !exportMode && selectedContact?.username === contact.username
                             return (
                                 <div
                                     key={contact.username}
-                                    className={`contact-item ${exportMode && isChecked ? 'selected' : ''} ${isActive ? 'active' : ''}`}
-                                    onClick={() => {
-                                        if (exportMode) {
-                                            toggleContactSelected(contact.username, !isChecked)
-                                        } else {
-                                            setSelectedContact(isActive ? null : contact)
-                                        }
-                                    }}
+                                    className="contact-row"
+                                    style={{ transform: `translateY(${top}px)` }}
                                 >
-                                    {exportMode && (
-                                        <label className="contact-select" onClick={e => e.stopPropagation()}>
-                                            <input
-                                                type="checkbox"
-                                                checked={isChecked}
-                                                onChange={e => toggleContactSelected(contact.username, e.target.checked)}
-                                            />
-                                        </label>
-                                    )}
-                                    <div className="contact-avatar">
-                                        {contact.avatarUrl ? (
-                                            <img src={contact.avatarUrl} alt="" />
-                                        ) : (
-                                            <span>{getAvatarLetter(contact.displayName)}</span>
+                                    <div
+                                        className={`contact-item ${exportMode && isChecked ? 'selected' : ''} ${isActive ? 'active' : ''}`}
+                                        onClick={() => {
+                                            if (exportMode) {
+                                                toggleContactSelected(contact.username, !isChecked)
+                                            } else {
+                                                setSelectedContact(isActive ? null : contact)
+                                            }
+                                        }}
+                                    >
+                                        {exportMode && (
+                                            <label className="contact-select" onClick={e => e.stopPropagation()}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isChecked}
+                                                    onChange={e => toggleContactSelected(contact.username, e.target.checked)}
+                                                />
+                                            </label>
                                         )}
-                                    </div>
-                                    <div className="contact-info">
-                                        <div className="contact-name">{contact.displayName}</div>
-                                        {contact.remark && contact.remark !== contact.displayName && (
-                                            <div className="contact-remark">备注: {contact.remark}</div>
-                                        )}
-                                    </div>
-                                    <div className={`contact-type ${contact.type}`}>
-                                        {getContactTypeIcon(contact.type)}
-                                        <span>{getContactTypeName(contact.type)}</span>
+                                        <div className="contact-avatar">
+                                            {contact.avatarUrl ? (
+                                                <img src={contact.avatarUrl} alt="" loading="lazy" />
+                                            ) : (
+                                                <span>{getAvatarLetter(contact.displayName)}</span>
+                                            )}
+                                        </div>
+                                        <div className="contact-info">
+                                            <div className="contact-name">{contact.displayName}</div>
+                                            {contact.remark && contact.remark !== contact.displayName && (
+                                                <div className="contact-remark">备注: {contact.remark}</div>
+                                            )}
+                                        </div>
+                                        <div className={`contact-type ${contact.type}`}>
+                                            {getContactTypeIcon(contact.type)}
+                                            <span>{getContactTypeName(contact.type)}</span>
+                                        </div>
                                     </div>
                                 </div>
                             )
-                        })}
+                            })}
+                        </div>
                     </div>
                 )}
             </div>

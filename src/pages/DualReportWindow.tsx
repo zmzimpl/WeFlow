@@ -107,7 +107,16 @@ function DualReportWindow() {
       setLoadingStage('完成')
 
       if (result.success && result.data) {
-        setReportData(result.data)
+        const normalizedResponse = result.data.response
+          ? {
+            ...result.data.response,
+            slowest: result.data.response.slowest ?? result.data.response.avg
+          }
+          : undefined
+        setReportData({
+          ...result.data,
+          response: normalizedResponse
+        })
         setIsLoading(false)
       } else {
         setError(result.error || '生成报告失败')

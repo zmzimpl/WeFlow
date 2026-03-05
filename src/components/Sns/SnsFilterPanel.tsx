@@ -57,6 +57,16 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
         setJumpTargetDate(undefined)
     }
 
+    const getEmptyStateText = () => {
+        if (loading && contacts.length === 0) {
+            return '正在加载联系人...'
+        }
+        if (contacts.length === 0) {
+            return '暂无好友或曾经的好友'
+        }
+        return '没有找到联系人'
+    }
+
     return (
         <aside className="sns-filter-panel">
             <div className="filter-header">
@@ -143,18 +153,22 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
                     </div>
 
                     <div className="contact-list-scroll">
-                        {filteredContacts.map(contact => (
+                        {filteredContacts.map(contact => {
+                            return (
                             <div
                                 key={contact.username}
                                 className={`contact-row ${selectedUsernames.includes(contact.username) ? 'selected' : ''}`}
                                 onClick={() => toggleUserSelection(contact.username)}
                             >
                                 <Avatar src={contact.avatarUrl} name={contact.displayName} size={36} shape="rounded" />
-                                <span className="contact-name">{contact.displayName}</span>
+                                <div className="contact-meta">
+                                    <span className="contact-name">{contact.displayName}</span>
+                                </div>
                             </div>
-                        ))}
+                            )
+                        })}
                         {filteredContacts.length === 0 && (
-                            <div className="empty-state">没有找到联系人</div>
+                            <div className="empty-state">{getEmptyStateText()}</div>
                         )}
                     </div>
                 </div>

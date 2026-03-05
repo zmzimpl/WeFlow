@@ -23,7 +23,7 @@
    ========================================= */
 .sns-main-viewport {
     flex: 1;
-    overflow-y: scroll;
+    overflow: hidden;
     position: relative;
     display: flex;
     justify-content: center;
@@ -35,7 +35,9 @@
     padding: 20px 24px 60px 24px;
     display: flex;
     flex-direction: column;
-    gap: 24px;
+    gap: 0;
+    min-height: 0;
+    height: 100%;
 }
 
 .feed-header {
@@ -44,12 +46,50 @@
     justify-content: space-between;
     margin-bottom: 8px;
     padding: 0 4px;
+    z-index: 2;
+    background: var(--sns-bg-color);
+    border-bottom: 1px solid var(--border-color);
+    padding-top: 10px;
+    padding-bottom: 10px;
 
-    h2 {
-        font-size: 20px;
-        font-weight: 700;
-        margin: 0;
-        color: var(--text-primary);
+    .feed-header-main {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 0;
+
+        h2 {
+            font-size: 20px;
+            font-weight: 700;
+            margin: 0;
+            color: var(--text-primary);
+        }
+    }
+
+    .feed-stats-line {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.4;
+
+        &.loading {
+            opacity: 0.7;
+        }
+
+        &.error {
+            color: #d94f45;
+        }
+    }
+
+    .feed-stats-retry {
+        border: none;
+        background: transparent;
+        color: inherit;
+        font-size: 13px;
+        padding: 0;
+        line-height: 1.4;
+        cursor: pointer;
+        text-decoration: underline;
+        text-underline-offset: 2px;
     }
 
     .header-actions {
@@ -83,6 +123,13 @@
             animation: spin 0.8s linear infinite;
         }
     }
+}
+
+.sns-posts-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-top: 16px;
 }
 
 .posts-list {
@@ -1031,9 +1078,11 @@
                     margin-bottom: 0;
                     /* Remove margin to merge */
 
-                    .contact-name {
-                        color: var(--primary);
-                        font-weight: 600;
+                    .contact-meta {
+                        .contact-name {
+                            color: var(--primary);
+                            font-weight: 600;
+                        }
                     }
 
                     /* If the NEXT item is also selected */
@@ -1056,13 +1105,20 @@
                     /* Compensate for missing border */
                 }
 
-                .contact-name {
+                .contact-meta {
                     flex: 1;
-                    font-size: 14px;
-                    color: var(--text-secondary);
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
+                    min-width: 0;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 2px;
+
+                    .contact-name {
+                        font-size: 14px;
+                        color: var(--text-secondary);
+                        white-space: nowrap;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                    }
                 }
             }
         }
@@ -1909,8 +1965,29 @@
     font-size: 12px;
     color: var(--text-tertiary);
     margin: 0;
-    padding-left: 24px;
     line-height: 1.4;
+}
+
+.export-media-check-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 8px;
+
+    label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--text-primary);
+        padding: 8px 10px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-secondary);
+    }
+
+    input[type='checkbox'] {
+        margin: 0;
+    }
 }
 
 .export-progress {

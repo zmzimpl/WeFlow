@@ -23,6 +23,18 @@ interface WelcomePageProps {
   standalone?: boolean
 }
 
+const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
+  const base = String(error || '自动获取密钥失败').trim()
+  const tailLogs = Array.isArray(logs)
+    ? logs
+      .map(item => String(item || '').trim())
+      .filter(Boolean)
+      .slice(-6)
+    : []
+  if (tailLogs.length === 0) return base
+  return `${base}；最近状态：${tailLogs.join(' | ')}`
+}
+
 function WelcomePage({ standalone = false }: WelcomePageProps) {
   const navigate = useNavigate()
   const { isDbConnected, setDbConnected, setLoading } = useAppStore()
@@ -292,7 +304,10 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
           setIsManualStartPrompt(true)
           setDbKeyStatus('需要手动启动微信')
         } else {
-          setError(result.error || '自动获取密钥失败')
+          if (result.error?.includes('尚未完成登录')) {
+            setDbKeyStatus('请先在微信完成登录后重试')
+          }
+          setError(formatDbKeyFailureMessage(result.error, result.logs))
         }
       }
     } catch (e) {

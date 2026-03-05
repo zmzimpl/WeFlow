@@ -61,7 +61,9 @@ function App() {
   const isOnboardingWindow = location.pathname === '/onboarding-window'
   const isVideoPlayerWindow = location.pathname === '/video-player-window'
   const isChatHistoryWindow = location.pathname.startsWith('/chat-history/')
+  const isStandaloneChatWindow = location.pathname === '/chat-window'
   const isNotificationWindow = location.pathname === '/notification-window'
+  const isExportRoute = location.pathname === '/export'
   const [themeHydrated, setThemeHydrated] = useState(false)
 
   // 锁定状态
@@ -398,6 +400,12 @@ function App() {
     return <ChatHistoryPage />
   }
 
+  // 独立会话聊天窗口（仅显示聊天内容区域）
+  if (isStandaloneChatWindow) {
+    const sessionId = new URLSearchParams(location.search).get('sessionId') || ''
+    return <ChatPage standaloneSessionWindow initialSessionId={sessionId} />
+  }
+
   // 独立通知窗口
   if (isNotificationWindow) {
     return <NotificationWindow />
@@ -528,6 +536,10 @@ function App() {
         <Sidebar />
         <main className="content">
           <RouteGuard>
+            <div className={`export-keepalive-page ${isExportRoute ? 'active' : 'hidden'}`} aria-hidden={!isExportRoute}>
+              <ExportPage />
+            </div>
+
             <Routes>
               <Route path="/" element={<HomePage />} />
               <Route path="/home" element={<HomePage />} />
@@ -542,7 +554,7 @@ function App() {
               <Route path="/dual-report/view" element={<DualReportWindow />} />
 
               <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/export" element={<ExportPage />} />
+              <Route path="/export" element={<div className="export-route-anchor" aria-hidden="true" />} />
               <Route path="/sns" element={<SnsPage />} />
               <Route path="/contacts" element={<ContactsPage />} />
               <Route path="/chat-history/:sessionId/:messageId" element={<ChatHistoryPage />} />

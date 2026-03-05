@@ -36,6 +36,18 @@ interface WxidOption {
   modifiedTime: number
 }
 
+const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
+  const base = String(error || '自动获取密钥失败').trim()
+  const tailLogs = Array.isArray(logs)
+    ? logs
+      .map(item => String(item || '').trim())
+      .filter(Boolean)
+      .slice(-6)
+    : []
+  if (tailLogs.length === 0) return base
+  return `${base}；最近状态：${tailLogs.join(' | ')}`
+}
+
 function SettingsPage() {
   const {
     isDbConnected,
@@ -103,12 +115,12 @@ function SettingsPage() {
 
   const [autoTranscribeVoice, setAutoTranscribeVoice] = useState(false)
   const [transcribeLanguages, setTranscribeLanguages] = useState<string[]>(['zh'])
-  const [exportDefaultFormat, setExportDefaultFormat] = useState('excel')
+  const [exportDefaultFormat, setExportDefaultFormat] = useState('json')
   const [exportDefaultDateRange, setExportDefaultDateRange] = useState('today')
   const [exportDefaultMedia, setExportDefaultMedia] = useState(false)
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
-  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
+  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(4)
 
   const [notificationEnabled, setNotificationEnabled] = useState(true)
   const [notificationPosition, setNotificationPosition] = useState<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'>('top-right')
@@ -286,7 +298,6 @@ function SettingsPage() {
       const savedWhisperModelDir = await configService.getWhisperModelDir()
       const savedAutoTranscribe = await configService.getAutoTranscribeVoice()
       const savedTranscribeLanguages = await configService.getTranscribeLanguages()
-      const savedExportDefaultFormat = await configService.getExportDefaultFormat()
       const savedExportDefaultDateRange = await configService.getExportDefaultDateRange()
       const savedExportDefaultMedia = await configService.getExportDefaultMedia()
       const savedExportDefaultVoiceAsText = await configService.getExportDefaultVoiceAsText()
@@ -327,12 +338,13 @@ function SettingsPage() {
       setLogEnabled(savedLogEnabled)
       setAutoTranscribeVoice(savedAutoTranscribe)
       setTranscribeLanguages(savedTranscribeLanguages)
-      setExportDefaultFormat(savedExportDefaultFormat || 'excel')
+      setExportDefaultFormat('json')
+      await configService.setExportDefaultFormat('json')
       setExportDefaultDateRange(savedExportDefaultDateRange || 'today')
       setExportDefaultMedia(savedExportDefaultMedia ?? false)
       setExportDefaultVoiceAsText(savedExportDefaultVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExportDefaultExcelCompactColumns ?? true)
-      setExportDefaultConcurrency(savedExportDefaultConcurrency ?? 2)
+      setExportDefaultConcurrency(savedExportDefaultConcurrency ?? 4)
 
       setNotificationEnabled(savedNotificationEnabled)
       setNotificationPosition(savedNotificationPosition)
@@ -725,7 +737,10 @@ function SettingsPage() {
           setIsManualStartPrompt(true)
           setDbKeyStatus('需要手动启动微信')
         } else {
-          showMessage(result.error || '自动获取密钥失败', false)
+          if (result.error?.includes('尚未完成登录')) {
+            setDbKeyStatus('请先在微信完成登录后重试')
+          }
+          showMessage(formatDbKeyFailureMessage(result.error, result.logs), false)
         }
       }
     } catch (e: any) {
@@ -1542,6 +1557,7 @@ function SettingsPage() {
     { value: 'chatlab', label: 'ChatLab', desc: '标准格式，支持其他软件导入' },
     { value: 'chatlab-jsonl', label: 'ChatLab JSONL', desc: '流式格式，适合大量消息' },
     { value: 'json', label: 'JSON', desc: '详细格式，包含完整消息信息' },
+    { value: 'arkme-json', label: 'Arkme JSON', desc: '紧凑 JSON，支持 sender 去重与关系统计' },
     { value: 'html', label: 'HTML', desc: '网页格式，可直接浏览' },
     { value: 'txt', label: 'TXT', desc: '纯文本，通用格式' },
     { value: 'weclone', label: 'WeClone CSV', desc: 'WeClone 兼容字段格式（CSV）' },

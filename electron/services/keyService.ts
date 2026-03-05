@@ -509,6 +509,58 @@ export class KeyService {
     return false
   }
 
+  private isLoginRelatedText(value: string): boolean {
+    const normalized = String(value || '').replace(/\s+/g, '').toLowerCase()
+    if (!normalized) return false
+    const keywords = [
+      '登录',
+      '扫码',
+      '二维码',
+      '请在手机上确认',
+      '手机确认',
+      '切换账号',
+      'wechatlogin',
+      'qrcode',
+      'scan'
+    ]
+    return keywords.some((keyword) => normalized.includes(keyword))
+  }
+
+  private async detectWeChatLoginRequired(pid: number): Promise<boolean> {
+    if (!this.ensureUser32()) return false
+    let loginRequired = false
+
+    const enumWindowsCallback = this.koffi.register((hWnd: any, _lParam: any) => {
+      if (!this.IsWindowVisible(hWnd)) return true
+      const title = this.getWindowTitle(hWnd)
+      if (!this.isWeChatWindowTitle(title)) return true
+
+      const pidBuf = Buffer.alloc(4)
+      this.GetWindowThreadProcessId(hWnd, pidBuf)
+      const windowPid = pidBuf.readUInt32LE(0)
+      if (windowPid !== pid) return true
+
+      if (this.isLoginRelatedText(title)) {
+        loginRequired = true
+        return false
+      }
+
+      const children = this.collectChildWindowInfos(hWnd)
+      for (const child of children) {
+        if (this.isLoginRelatedText(child.title) || this.isLoginRelatedText(child.className)) {
+          loginRequired = true
+          return false
+        }
+      }
+      return true
+    }, this.WNDENUMPROC_PTR)
+
+    this.EnumWindows(enumWindowsCallback, 0)
+    this.koffi.unregister(enumWindowsCallback)
+
+    return loginRequired
+  }
+
   private async waitForWeChatWindowComponents(pid: number, timeoutMs = 15000): Promise<boolean> {
     if (!this.ensureUser32()) return true
     const startTime = Date.now()
@@ -605,6 +657,7 @@ export class KeyService {
 
     const keyBuffer = Buffer.alloc(128)
     const start = Date.now()
+    let loginRequiredDetected = false
 
     try {
       while (Date.now() - start < timeoutMs) {
@@ -624,6 +677,9 @@ export class KeyService {
           const level = levelOut[0] ?? 0
           if (msg) {
             logs.push(msg)
+            if (this.isLoginRelatedText(msg)) {
+              loginRequiredDetected = true
+            }
             onStatus?.(msg, level)
           }
         }
@@ -633,6 +689,15 @@ export class KeyService {
       try {
         this.cleanupHook()
       } catch { }
+    }
+
+    const loginRequired = loginRequiredDetected || await this.detectWeChatLoginRequired(pid)
+    if (loginRequired) {
+      return {
+        success: false,
+        error: '微信已启动但尚未完成登录，请先在微信客户端完成登录后再重试自动获取密钥。',
+        logs
+      }
     }
 
     return { success: false, error: '获取密钥超时', logs }

@@ -26,6 +26,48 @@
   margin: 0 0 48px;
 }
 
+.page-desc.load-summary {
+  margin: 0 0 28px;
+}
+
+.page-desc.load-summary.complete {
+  color: var(--text-secondary);
+}
+
+.load-telemetry {
+  width: min(760px, 100%);
+  padding: 12px 14px;
+  margin: 0 0 28px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+  background: color-mix(in srgb, var(--card-bg) 92%, transparent);
+  text-align: left;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+
+  p {
+    margin: 4px 0;
+  }
+
+  .label {
+    color: var(--text-tertiary);
+  }
+}
+
+.load-telemetry.loading {
+  border-color: color-mix(in srgb, var(--primary) 30%, var(--border-color));
+}
+
+.load-telemetry.complete {
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--border-color));
+}
+
+.load-telemetry.compact {
+  margin: 12px 0 0;
+  width: min(560px, 100%);
+}
+
 .report-sections {
   display: flex;
   flex-direction: column;
@@ -83,6 +125,14 @@
   color: var(--text-tertiary);
 }
 
+.year-grid-with-status {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
 .year-grid {
   display: flex;
   flex-wrap: wrap;
@@ -95,7 +145,39 @@
 .report-section .year-grid {
   justify-content: flex-start;
   max-width: none;
-  margin-bottom: 24px;
+  margin-bottom: 0;
+}
+
+.year-grid-with-status .year-grid {
+  flex: 1;
+}
+
+.year-load-status {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  margin-top: 6px;
+  flex-shrink: 0;
+}
+
+.year-load-status.complete {
+  color: color-mix(in srgb, var(--primary) 80%, var(--text-secondary));
+}
+
+.dot-ellipsis {
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+  vertical-align: bottom;
+  animation: dot-ellipsis 1.2s steps(4, end) infinite;
+}
+
+.year-load-status.complete .dot-ellipsis,
+.page-desc.load-summary.complete .dot-ellipsis {
+  animation: none;
+  width: 0;
 }
 
 .year-card {
@@ -184,4 +266,8 @@
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+@keyframes dot-ellipsis {
+  to { width: 1.4em; }
 }

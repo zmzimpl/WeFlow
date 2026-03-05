@@ -85,7 +85,34 @@ export interface AnnualReportData {
   } | null
 }
 
+export interface AvailableYearsLoadProgress {
+  years: number[]
+  strategy: 'cache' | 'native' | 'hybrid'
+  phase: 'cache' | 'native' | 'scan'
+  statusText: string
+  nativeElapsedMs: number
+  scanElapsedMs: number
+  totalElapsedMs: number
+  switched?: boolean
+  nativeTimedOut?: boolean
+}
+
+interface AvailableYearsLoadMeta {
+  strategy: 'cache' | 'native' | 'hybrid'
+  nativeElapsedMs: number
+  scanElapsedMs: number
+  totalElapsedMs: number
+  switched: boolean
+  nativeTimedOut: boolean
+  statusText: string
+}
+
 class AnnualReportService {
+  private readonly availableYearsCacheTtlMs = 10 * 60 * 1000
+  private readonly availableYearsScanConcurrency = 4
+  private readonly availableYearsColumnCache = new Map<string, string>()
+  private readonly availableYearsCache = new Map<string, { years: number[]; updatedAt: number }>()
+
   constructor() {
   }
 
@@ -178,6 +205,234 @@ class AnnualReportService {
       return ts > 0 ? ts : null
     } finally {
       await wcdbService.closeMessageCursor(cursor.cursor)
+    }
+  }
+
+  private quoteSqlIdentifier(identifier: string): string {
+    return `"${String(identifier || '').replace(/"/g, '""')}"`
+  }
+
+  private toUnixTimestamp(value: any): number {
+    const n = Number(value)
+    if (!Number.isFinite(n) || n <= 0) return 0
+    // 兼容毫秒级时间戳
+    const seconds = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n)
+    return seconds > 0 ? seconds : 0
+  }
+
+  private addYearsFromRange(years: Set<number>, firstTs: number, lastTs: number): boolean {
+    let changed = false
+    const currentYear = new Date().getFullYear()
+    const minTs = firstTs > 0 ? firstTs : lastTs
+    const maxTs = lastTs > 0 ? lastTs : firstTs
+    if (minTs <= 0 || maxTs <= 0) return changed
+
+    const minYear = new Date(minTs * 1000).getFullYear()
+    const maxYear = new Date(maxTs * 1000).getFullYear()
+    for (let y = minYear; y <= maxYear; y++) {
+      if (y >= 2010 && y <= currentYear && !years.has(y)) {
+        years.add(y)
+        changed = true
+      }
+    }
+    return changed
+  }
+
+  private normalizeAvailableYears(years: Iterable<number>): number[] {
+    return Array.from(new Set(Array.from(years)))
+      .filter((y) => Number.isFinite(y))
+      .map((y) => Math.floor(y))
+      .sort((a, b) => b - a)
+  }
+
+  private async forEachWithConcurrency<T>(
+    items: T[],
+    concurrency: number,
+    handler: (item: T, index: number) => Promise<void>,
+    shouldStop?: () => boolean
+  ): Promise<void> {
+    if (!items.length) return
+    const workerCount = Math.max(1, Math.min(concurrency, items.length))
+    let nextIndex = 0
+    const workers: Promise<void>[] = []
+
+    for (let i = 0; i < workerCount; i++) {
+      workers.push((async () => {
+        while (true) {
+          if (shouldStop?.()) break
+          const current = nextIndex
+          nextIndex += 1
+          if (current >= items.length) break
+          await handler(items[current], current)
+        }
+      })())
+    }
+
+    await Promise.all(workers)
+  }
+
+  private async detectTimeColumn(dbPath: string, tableName: string): Promise<string | null> {
+    const cacheKey = `${dbPath}\u0001${tableName}`
+    if (this.availableYearsColumnCache.has(cacheKey)) {
+      const cached = this.availableYearsColumnCache.get(cacheKey) || ''
+      return cached || null
+    }
+
+    const result = await wcdbService.execQuery('message', dbPath, `PRAGMA table_info(${this.quoteSqlIdentifier(tableName)})`)
+    if (!result.success || !Array.isArray(result.rows) || result.rows.length === 0) {
+      this.availableYearsColumnCache.set(cacheKey, '')
+      return null
+    }
+
+    const candidates = ['create_time', 'createtime', 'msg_create_time', 'msg_time', 'msgtime', 'time']
+    const columns = new Set<string>()
+    for (const row of result.rows as Record<string, any>[]) {
+      const name = String(row.name || row.column_name || row.columnName || '').trim().toLowerCase()
+      if (name) columns.add(name)
+    }
+
+    for (const candidate of candidates) {
+      if (columns.has(candidate)) {
+        this.availableYearsColumnCache.set(cacheKey, candidate)
+        return candidate
+      }
+    }
+
+    this.availableYearsColumnCache.set(cacheKey, '')
+    return null
+  }
+
+  private async getTableTimeRange(dbPath: string, tableName: string): Promise<{ first: number; last: number } | null> {
+    const cacheKey = `${dbPath}\u0001${tableName}`
+    const cachedColumn = this.availableYearsColumnCache.get(cacheKey)
+    const initialColumn = cachedColumn && cachedColumn.length > 0 ? cachedColumn : 'create_time'
+    const tried = new Set<string>()
+
+    const queryByColumn = async (column: string): Promise<{ first: number; last: number } | null> => {
+      const sql = `SELECT MIN(${this.quoteSqlIdentifier(column)}) AS first_ts, MAX(${this.quoteSqlIdentifier(column)}) AS last_ts FROM ${this.quoteSqlIdentifier(tableName)}`
+      const result = await wcdbService.execQuery('message', dbPath, sql)
+      if (!result.success || !Array.isArray(result.rows) || result.rows.length === 0) return null
+      const row = result.rows[0] as Record<string, any>
+      const first = this.toUnixTimestamp(row.first_ts ?? row.firstTs ?? row.min_ts ?? row.minTs)
+      const last = this.toUnixTimestamp(row.last_ts ?? row.lastTs ?? row.max_ts ?? row.maxTs)
+      return { first, last }
+    }
+
+    tried.add(initialColumn)
+    const quick = await queryByColumn(initialColumn)
+    if (quick) {
+      if (!cachedColumn) this.availableYearsColumnCache.set(cacheKey, initialColumn)
+      return quick
+    }
+
+    const detectedColumn = await this.detectTimeColumn(dbPath, tableName)
+    if (!detectedColumn || tried.has(detectedColumn)) {
+      return null
+    }
+
+    return queryByColumn(detectedColumn)
+  }
+
+  private async getAvailableYearsByTableScan(
+    sessionIds: string[],
+    options?: { onProgress?: (years: number[]) => void; shouldCancel?: () => boolean }
+  ): Promise<number[]> {
+    const years = new Set<number>()
+    let lastEmittedSize = 0
+
+    const emitIfChanged = (force = false) => {
+      if (!options?.onProgress) return
+      const next = this.normalizeAvailableYears(years)
+      if (!force && next.length === lastEmittedSize) return
+      options.onProgress(next)
+      lastEmittedSize = next.length
+    }
+
+    const shouldCancel = () => options?.shouldCancel?.() === true
+
+    await this.forEachWithConcurrency(sessionIds, this.availableYearsScanConcurrency, async (sessionId) => {
+      if (shouldCancel()) return
+      const tableStats = await wcdbService.getMessageTableStats(sessionId)
+      if (!tableStats.success || !Array.isArray(tableStats.tables) || tableStats.tables.length === 0) {
+        return
+      }
+
+      for (const table of tableStats.tables as Record<string, any>[]) {
+        if (shouldCancel()) return
+        const tableName = String(table.table_name || table.name || '').trim()
+        const dbPath = String(table.db_path || table.dbPath || '').trim()
+        if (!tableName || !dbPath) continue
+
+        const range = await this.getTableTimeRange(dbPath, tableName)
+        if (!range) continue
+        const changed = this.addYearsFromRange(years, range.first, range.last)
+        if (changed) emitIfChanged()
+      }
+    }, shouldCancel)
+
+    emitIfChanged(true)
+    return this.normalizeAvailableYears(years)
+  }
+
+  private async getAvailableYearsByEdgeScan(
+    sessionIds: string[],
+    options?: { onProgress?: (years: number[]) => void; shouldCancel?: () => boolean }
+  ): Promise<number[]> {
+    const years = new Set<number>()
+    let lastEmittedSize = 0
+    const shouldCancel = () => options?.shouldCancel?.() === true
+
+    const emitIfChanged = (force = false) => {
+      if (!options?.onProgress) return
+      const next = this.normalizeAvailableYears(years)
+      if (!force && next.length === lastEmittedSize) return
+      options.onProgress(next)
+      lastEmittedSize = next.length
+    }
+
+    for (const sessionId of sessionIds) {
+      if (shouldCancel()) break
+      const first = await this.getEdgeMessageTime(sessionId, true)
+      const last = await this.getEdgeMessageTime(sessionId, false)
+      const changed = this.addYearsFromRange(years, first || 0, last || 0)
+      if (changed) emitIfChanged()
+    }
+    emitIfChanged(true)
+    return this.normalizeAvailableYears(years)
+  }
+
+  private buildAvailableYearsCacheKey(dbPath: string, cleanedWxid: string): string {
+    return `${dbPath}\u0001${cleanedWxid}`
+  }
+
+  private getCachedAvailableYears(cacheKey: string): number[] | null {
+    const cached = this.availableYearsCache.get(cacheKey)
+    if (!cached) return null
+    if (Date.now() - cached.updatedAt > this.availableYearsCacheTtlMs) {
+      this.availableYearsCache.delete(cacheKey)
+      return null
+    }
+    return [...cached.years]
+  }
+
+  private setCachedAvailableYears(cacheKey: string, years: number[]): void {
+    const normalized = this.normalizeAvailableYears(years)
+
+    this.availableYearsCache.set(cacheKey, {
+      years: normalized,
+      updatedAt: Date.now()
+    })
+
+    if (this.availableYearsCache.size > 8) {
+      let oldestKey = ''
+      let oldestTime = Number.POSITIVE_INFINITY
+      for (const [key, val] of this.availableYearsCache) {
+        if (val.updatedAt < oldestTime) {
+          oldestTime = val.updatedAt
+          oldestKey = key
+        }
+      }
+      if (oldestKey) this.availableYearsCache.delete(oldestKey)
     }
   }
 
@@ -359,38 +614,226 @@ class AnnualReportService {
     return { sessionId: bestSessionId, days: bestDays, start: bestStart, end: bestEnd }
   }
 
-  async getAvailableYears(params: { dbPath: string; decryptKey: string; wxid: string }): Promise<{ success: boolean; data?: number[]; error?: string }> {
+  async getAvailableYears(params: {
+    dbPath: string
+    decryptKey: string
+    wxid: string
+    onProgress?: (payload: AvailableYearsLoadProgress) => void
+    shouldCancel?: () => boolean
+    nativeTimeoutMs?: number
+  }): Promise<{ success: boolean; data?: number[]; error?: string; meta?: AvailableYearsLoadMeta }> {
     try {
+      const isCancelled = () => params.shouldCancel?.() === true
+      const totalStartedAt = Date.now()
+      let nativeElapsedMs = 0
+      let scanElapsedMs = 0
+      let switched = false
+      let nativeTimedOut = false
+      let latestYears: number[] = []
+
+      const emitProgress = (payload: {
+        years?: number[]
+        strategy: 'cache' | 'native' | 'hybrid'
+        phase: 'cache' | 'native' | 'scan'
+        statusText: string
+        switched?: boolean
+        nativeTimedOut?: boolean
+      }) => {
+        if (!params.onProgress) return
+        if (Array.isArray(payload.years)) latestYears = payload.years
+        params.onProgress({
+          years: latestYears,
+          strategy: payload.strategy,
+          phase: payload.phase,
+          statusText: payload.statusText,
+          nativeElapsedMs,
+          scanElapsedMs,
+          totalElapsedMs: Date.now() - totalStartedAt,
+          switched: payload.switched ?? switched,
+          nativeTimedOut: payload.nativeTimedOut ?? nativeTimedOut
+        })
+      }
+
+      const buildMeta = (
+        strategy: 'cache' | 'native' | 'hybrid',
+        statusText: string
+      ): AvailableYearsLoadMeta => ({
+        strategy,
+        nativeElapsedMs,
+        scanElapsedMs,
+        totalElapsedMs: Date.now() - totalStartedAt,
+        switched,
+        nativeTimedOut,
+        statusText
+      })
+
       const conn = await this.ensureConnectedWithConfig(params.dbPath, params.decryptKey, params.wxid)
-      if (!conn.success || !conn.cleanedWxid) return { success: false, error: conn.error }
-
-      const sessionIds = await this.getPrivateSessions(conn.cleanedWxid)
-      if (sessionIds.length === 0) {
-        return { success: false, error: '未找到消息会话' }
-      }
-
-      const fastYears = await wcdbService.getAvailableYears(sessionIds)
-      if (fastYears.success && fastYears.data) {
-        return { success: true, data: fastYears.data }
-      }
-
-      const years = new Set<number>()
-      for (const sessionId of sessionIds) {
-        const first = await this.getEdgeMessageTime(sessionId, true)
-        const last = await this.getEdgeMessageTime(sessionId, false)
-        if (!first && !last) continue
-
-        const minYear = new Date((first || last || 0) * 1000).getFullYear()
-        const maxYear = new Date((last || first || 0) * 1000).getFullYear()
-        for (let y = minYear; y <= maxYear; y++) {
-          if (y >= 2010 && y <= new Date().getFullYear()) years.add(y)
+      if (!conn.success || !conn.cleanedWxid) return { success: false, error: conn.error, meta: buildMeta('hybrid', '连接数据库失败') }
+      if (isCancelled()) return { success: false, error: '已取消加载年份数据', meta: buildMeta('hybrid', '已取消加载年份数据') }
+      const cacheKey = this.buildAvailableYearsCacheKey(params.dbPath, conn.cleanedWxid)
+      const cached = this.getCachedAvailableYears(cacheKey)
+      if (cached) {
+        latestYears = cached
+        emitProgress({
+          years: cached,
+          strategy: 'cache',
+          phase: 'cache',
+          statusText: '命中缓存，已快速加载年份数据'
+        })
+        return {
+          success: true,
+          data: cached,
+          meta: buildMeta('cache', '命中缓存，已快速加载年份数据')
         }
       }
 
-      const sortedYears = Array.from(years).sort((a, b) => b - a)
-      return { success: true, data: sortedYears }
+      const sessionIds = await this.getPrivateSessions(conn.cleanedWxid)
+      if (sessionIds.length === 0) {
+        return { success: false, error: '未找到消息会话', meta: buildMeta('hybrid', '未找到消息会话') }
+      }
+      if (isCancelled()) return { success: false, error: '已取消加载年份数据', meta: buildMeta('hybrid', '已取消加载年份数据') }
+
+      const nativeTimeoutMs = Math.max(1000, Math.floor(params.nativeTimeoutMs || 5000))
+      const nativeStartedAt = Date.now()
+      let nativeTicker: ReturnType<typeof setInterval> | null = null
+
+      emitProgress({
+        strategy: 'native',
+        phase: 'native',
+        statusText: '正在使用原生快速模式加载年份...'
+      })
+      nativeTicker = setInterval(() => {
+        nativeElapsedMs = Date.now() - nativeStartedAt
+        emitProgress({
+          strategy: 'native',
+          phase: 'native',
+          statusText: '正在使用原生快速模式加载年份...'
+        })
+      }, 120)
+
+      const nativeRace = await Promise.race([
+        wcdbService.getAvailableYears(sessionIds)
+          .then((result) => ({ kind: 'result' as const, result }))
+          .catch((error) => ({ kind: 'error' as const, error: String(error) })),
+        new Promise<{ kind: 'timeout' }>((resolve) => setTimeout(() => resolve({ kind: 'timeout' }), nativeTimeoutMs))
+      ])
+
+      if (nativeTicker) {
+        clearInterval(nativeTicker)
+        nativeTicker = null
+      }
+      nativeElapsedMs = Math.max(nativeElapsedMs, Date.now() - nativeStartedAt)
+
+      if (isCancelled()) return { success: false, error: '已取消加载年份数据', meta: buildMeta('hybrid', '已取消加载年份数据') }
+
+      if (nativeRace.kind === 'result' && nativeRace.result.success && Array.isArray(nativeRace.result.data) && nativeRace.result.data.length > 0) {
+        const years = this.normalizeAvailableYears(nativeRace.result.data)
+        latestYears = years
+        this.setCachedAvailableYears(cacheKey, years)
+        emitProgress({
+          years,
+          strategy: 'native',
+          phase: 'native',
+          statusText: '原生快速模式加载完成'
+        })
+        return {
+          success: true,
+          data: years,
+          meta: buildMeta('native', '原生快速模式加载完成')
+        }
+      }
+
+      switched = true
+      nativeTimedOut = nativeRace.kind === 'timeout'
+      emitProgress({
+        strategy: 'hybrid',
+        phase: 'native',
+        statusText: nativeTimedOut
+          ? '原生快速模式超时，已自动切换到扫表兼容模式...'
+          : '原生快速模式不可用，已自动切换到扫表兼容模式...',
+        switched: true,
+        nativeTimedOut
+      })
+
+      const scanStartedAt = Date.now()
+      let scanTicker: ReturnType<typeof setInterval> | null = null
+      scanTicker = setInterval(() => {
+        scanElapsedMs = Date.now() - scanStartedAt
+        emitProgress({
+          strategy: 'hybrid',
+          phase: 'scan',
+          statusText: nativeTimedOut
+            ? '原生已超时，正在使用扫表兼容模式加载年份...'
+            : '正在使用扫表兼容模式加载年份...',
+          switched: true,
+          nativeTimedOut
+        })
+      }, 120)
+
+      let years = await this.getAvailableYearsByTableScan(sessionIds, {
+        onProgress: (items) => {
+          latestYears = items
+          scanElapsedMs = Date.now() - scanStartedAt
+          emitProgress({
+            years: items,
+            strategy: 'hybrid',
+            phase: 'scan',
+            statusText: nativeTimedOut
+              ? '原生已超时，正在使用扫表兼容模式加载年份...'
+              : '正在使用扫表兼容模式加载年份...',
+            switched: true,
+            nativeTimedOut
+          })
+        },
+        shouldCancel: params.shouldCancel
+      })
+
+      if (isCancelled()) {
+        if (scanTicker) clearInterval(scanTicker)
+        return { success: false, error: '已取消加载年份数据', meta: buildMeta('hybrid', '已取消加载年份数据') }
+      }
+      if (years.length === 0) {
+        years = await this.getAvailableYearsByEdgeScan(sessionIds, {
+          onProgress: (items) => {
+            latestYears = items
+            scanElapsedMs = Date.now() - scanStartedAt
+            emitProgress({
+              years: items,
+              strategy: 'hybrid',
+              phase: 'scan',
+              statusText: '扫表结果为空，正在执行游标兜底扫描...',
+              switched: true,
+              nativeTimedOut
+            })
+          },
+          shouldCancel: params.shouldCancel
+        })
+      }
+      if (scanTicker) {
+        clearInterval(scanTicker)
+        scanTicker = null
+      }
+      scanElapsedMs = Math.max(scanElapsedMs, Date.now() - scanStartedAt)
+
+      if (isCancelled()) return { success: false, error: '已取消加载年份数据', meta: buildMeta('hybrid', '已取消加载年份数据') }
+
+      this.setCachedAvailableYears(cacheKey, years)
+      latestYears = years
+      emitProgress({
+        years,
+        strategy: 'hybrid',
+        phase: 'scan',
+        statusText: '扫表兼容模式加载完成',
+        switched: true,
+        nativeTimedOut
+      })
+      return {
+        success: true,
+        data: years,
+        meta: buildMeta('hybrid', '扫表兼容模式加载完成')
+      }
     } catch (e) {
-      return { success: false, error: String(e) }
+      return { success: false, error: String(e), meta: { strategy: 'hybrid', nativeElapsedMs: 0, scanElapsedMs: 0, totalElapsedMs: 0, switched: false, nativeTimedOut: false, statusText: '加载年度数据失败' } }
     }
   }
 
