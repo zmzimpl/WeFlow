@@ -112,6 +112,53 @@
     color: var(--text-tertiary);
   }
 
+  .format-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
+    gap: 6px;
+    width: 100%;
+    margin-bottom: 10px;
+  }
+
+  .format-card {
+    width: 100%;
+    min-height: 0;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 8px 10px;
+    text-align: left;
+    background: var(--bg-primary);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-start;
+    transition: border-color 0.2s ease, background 0.2s ease;
+
+    &:hover {
+      border-color: var(--text-tertiary);
+    }
+
+    &.active {
+      border-color: var(--primary);
+      background: rgba(var(--primary-rgb), 0.08);
+    }
+  }
+
+  .format-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.35;
+  }
+
+  .format-desc {
+    margin-top: 1px;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    line-height: 1.35;
+  }
+
   .select-option.active .option-desc {
     color: var(--primary);
   }
@@ -275,6 +322,11 @@
       max-width: 360px;
       margin-bottom: 0;
     }
+
+    .format-grid {
+      max-width: 360px;
+      margin-bottom: 0;
+    }
   }
 }
 
@@ -291,7 +343,8 @@
 
     .select-field,
     .settings-time-range-field,
-    .log-toggle-line {
+    .log-toggle-line,
+    .format-grid {
       max-width: none;
     }
   }

@@ -54,11 +54,9 @@ export function ExportDefaultsSettingsForm({
   onDefaultsChanged,
   layout = 'stacked'
 }: ExportDefaultsSettingsFormProps) {
-  const [showExportFormatSelect, setShowExportFormatSelect] = useState(false)
   const [showExportExcelColumnsSelect, setShowExportExcelColumnsSelect] = useState(false)
   const [showExportConcurrencySelect, setShowExportConcurrencySelect] = useState(false)
   const [isExportDateRangeDialogOpen, setIsExportDateRangeDialogOpen] = useState(false)
-  const exportFormatDropdownRef = useRef<HTMLDivElement>(null)
   const exportExcelColumnsDropdownRef = useRef<HTMLDivElement>(null)
   const exportConcurrencyDropdownRef = useRef<HTMLDivElement>(null)
 
@@ -99,9 +97,6 @@ export function ExportDefaultsSettingsForm({
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as Node
-      if (showExportFormatSelect && exportFormatDropdownRef.current && !exportFormatDropdownRef.current.contains(target)) {
-        setShowExportFormatSelect(false)
-      }
       if (showExportExcelColumnsSelect && exportExcelColumnsDropdownRef.current && !exportExcelColumnsDropdownRef.current.contains(target)) {
         setShowExportExcelColumnsSelect(false)
       }
@@ -112,10 +107,9 @@ export function ExportDefaultsSettingsForm({
 
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
-  }, [showExportFormatSelect, showExportExcelColumnsSelect, showExportConcurrencySelect])
+  }, [showExportExcelColumnsSelect, showExportConcurrencySelect])
 
   const exportExcelColumnsValue = exportDefaultExcelCompactColumns ? 'compact' : 'full'
-  const exportFormatLabel = useMemo(() => getOptionLabel(exportFormatOptions, exportDefaultFormat), [exportDefaultFormat])
   const exportDateRangeLabel = useMemo(() => getExportDateRangeLabel(exportDefaultDateRange), [exportDefaultDateRange])
   const exportExcelColumnsLabel = useMemo(() => getOptionLabel(exportExcelColumnOptions, exportExcelColumnsValue), [exportExcelColumnsValue])
   const exportConcurrencyLabel = String(exportDefaultConcurrency)
@@ -138,7 +132,6 @@ export function ExportDefaultsSettingsForm({
               className={`select-trigger ${showExportConcurrencySelect ? 'open' : ''}`}
               onClick={() => {
                 setShowExportConcurrencySelect(!showExportConcurrencySelect)
-                setShowExportFormatSelect(false)
                 setIsExportDateRangeDialogOpen(false)
                 setShowExportExcelColumnsSelect(false)
               }}
@@ -172,45 +165,27 @@ export function ExportDefaultsSettingsForm({
 
       <div className="form-group">
         <div className="form-copy">
-          <label>默认导出格式</label>
+          <label>聊天消息默认导出格式</label>
           <span className="form-hint">导出页面默认选中的格式</span>
         </div>
         <div className="form-control">
-          <div className="select-field" ref={exportFormatDropdownRef}>
-            <button
-              type="button"
-              className={`select-trigger ${showExportFormatSelect ? 'open' : ''}`}
-              onClick={() => {
-                setShowExportFormatSelect(!showExportFormatSelect)
-                setIsExportDateRangeDialogOpen(false)
-                setShowExportExcelColumnsSelect(false)
-                setShowExportConcurrencySelect(false)
-              }}
-            >
-              <span className="select-value">{exportFormatLabel}</span>
-              <ChevronDown size={16} />
-            </button>
-            {showExportFormatSelect && (
-              <div className="select-dropdown">
-                {exportFormatOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`select-option ${exportDefaultFormat === option.value ? 'active' : ''}`}
-                    onClick={async () => {
-                      setExportDefaultFormat(option.value)
-                      await configService.setExportDefaultFormat(option.value)
-                      onDefaultsChanged?.({ format: option.value })
-                      notify('已更新导出格式默认值', true)
-                      setShowExportFormatSelect(false)
-                    }}
-                  >
-                    <span className="option-label">{option.label}</span>
-                    <span className="option-desc">{option.desc}</span>
-                  </button>
-                ))}
-              </div>
-            )}
+          <div className="format-grid">
+            {exportFormatOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                className={`format-card ${exportDefaultFormat === option.value ? 'active' : ''}`}
+                onClick={async () => {
+                  setExportDefaultFormat(option.value)
+                  await configService.setExportDefaultFormat(option.value)
+                  onDefaultsChanged?.({ format: option.value })
+                  notify('已更新导出格式默认值', true)
+                }}
+              >
+                <span className="format-label">{option.label}</span>
+                <span className="format-desc">{option.desc}</span>
+              </button>
+            ))}
           </div>
         </div>
       </div>
@@ -226,7 +201,6 @@ export function ExportDefaultsSettingsForm({
               type="button"
               className={`settings-time-range-trigger ${isExportDateRangeDialogOpen ? 'open' : ''}`}
               onClick={() => {
-                setShowExportFormatSelect(false)
                 setShowExportExcelColumnsSelect(false)
                 setShowExportConcurrencySelect(false)
                 setIsExportDateRangeDialogOpen(true)
@@ -292,7 +266,6 @@ export function ExportDefaultsSettingsForm({
               className={`select-trigger ${showExportExcelColumnsSelect ? 'open' : ''}`}
               onClick={() => {
                 setShowExportExcelColumnsSelect(!showExportExcelColumnsSelect)
-                setShowExportFormatSelect(false)
                 setIsExportDateRangeDialogOpen(false)
                 setShowExportConcurrencySelect(false)
               }}
