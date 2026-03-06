@@ -4921,9 +4921,7 @@ function ExportPage() {
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
   const avatarExportStatusLabel = options.exportAvatars ? '已开启聊天消息导出带头像' : '已关闭聊天消息导出带头像'
-  const textContentFormatNote = options.exportAvatars
-    ? '此模式包含用户头像，不导出图片语音视频表情包等多媒体内容'
-    : '此模式不包含用户头像，不导出图片语音视频表情包等多媒体内容'
+  const contentTextDialogSummary = '此模式只导出聊天文本，不包含图片语音视频表情包等多媒体文件。'
   const activeDialogFormatLabel = exportDialog.scope === 'sns'
     ? (snsFormatOptions.find(option => option.value === snsExportFormat)?.label ?? snsExportFormat)
     : (formatOptions.find(option => option.value === options.format)?.label ?? options.format)
@@ -6059,7 +6057,12 @@ function ExportPage() {
         <div className="export-dialog-overlay" onClick={closeExportDialog}>
           <div className="export-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
             <div className="dialog-header">
-              <h3>{exportDialog.title}</h3>
+              <div className="dialog-header-copy">
+                <h3>{exportDialog.title}</h3>
+                {isContentTextDialog && (
+                  <div className="dialog-header-note">{contentTextDialogSummary}</div>
+                )}
+              </div>
               <button className="close-icon-btn" onClick={closeExportDialog}><X size={16} /></button>
             </div>
 
@@ -6121,7 +6124,7 @@ function ExportPage() {
                     <div className="format-note">{avatarExportStatusLabel}</div>
                   )}
                   {isContentTextDialog && (
-                    <div className="format-note">{textContentFormatNote}</div>
+                    <div className="format-note">{avatarExportStatusLabel}</div>
                   )}
                   {!useCollapsedSessionFormatSelector && (
                     <div className="format-grid">

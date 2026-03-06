@@ -2794,6 +2794,19 @@
   }
 }
 
+.dialog-header-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dialog-header-note {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
 .close-icon-btn {
   border: 1px solid var(--border-color);
   background: var(--bg-secondary);
