@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useChatStore } from '../stores/chatStore'
-import type { ChatSession } from '../types/models'
+import type { ChatSession, Message } from '../types/models'
 import { useNavigate } from 'react-router-dom'
 
 export function GlobalSessionMonitor() {
@@ -20,9 +20,9 @@ export function GlobalSessionMonitor() {
     }, [sessions])
 
     // 去重辅助函数：获取消息 key
-    const getMessageKey = (msg: any) => {
-        if (msg.localId && msg.localId > 0) return `l:${msg.localId}`
-        return `t:${msg.createTime}:${msg.sortSeq || 0}:${msg.serverId || 0}`
+    const getMessageKey = (msg: Message) => {
+        if (msg.messageKey) return msg.messageKey
+        return `fallback:${msg.serverId || 0}:${msg.createTime}:${msg.sortSeq || 0}:${msg.localId || 0}:${msg.senderUsername || ''}:${msg.localType || 0}`
     }
 
     // 处理数据库变更
@@ -96,8 +96,8 @@ export function GlobalSessionMonitor() {
             if (!isCurrentSession && (!oldSession || newSession.lastTimestamp > oldSession.lastTimestamp)) {
                 // 这是新消息事件
 
-                // 折叠群、折叠入口不弹通知
-                if (newSession.isFolded) continue
+                // 免打扰、折叠群、折叠入口不弹通知
+                if (newSession.isMuted || newSession.isFolded) continue
                 if (newSession.username.toLowerCase().includes('placeholder_foldgroup')) continue
 
                 // 1. 群聊过滤自己发送的消息
@@ -267,7 +267,12 @@ export function GlobalSessionMonitor() {
         try {
             const result = await (window.electronAPI.chat as any).getNewMessages(sessionId, minTime)
             if (result.success && result.messages && result.messages.length > 0) {
-                appendMessages(result.messages, false) // 追加到末尾
+                const latestMessages = useChatStore.getState().messages || []
+                const existingKeys = new Set(latestMessages.map(getMessageKey))
+                const newMessages = result.messages.filter((msg: Message) => !existingKeys.has(getMessageKey(msg)))
+                if (newMessages.length > 0) {
+                    appendMessages(newMessages, false)
+                }
             }
         } catch (e) {
             console.warn('后台活跃会话刷新失败:', e)

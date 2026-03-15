@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, Users, FolderClosed, UserCheck, Crown, Aperture } from 'lucide-react'
+import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { useChatStore } from '../stores/chatStore'
@@ -377,7 +377,7 @@ const SessionItem = React.memo(function SessionItem({
 
   return (
     <div
-      className={`session-item ${isActive ? 'active' : ''}`}
+      className={`session-item ${isActive ? 'active' : ''} ${session.isMuted ? 'muted' : ''}`}
       onClick={() => onSelect(session)}
     >
       <Avatar
@@ -394,8 +394,9 @@ const SessionItem = React.memo(function SessionItem({
         <div className="session-bottom">
           <span className="session-summary">{session.summary || '暂无消息'}</span>
           <div className="session-badges">
+            {session.isMuted && <BellOff size={12} className="mute-icon" />}
             {session.unreadCount > 0 && (
-              <span className="unread-badge">
+              <span className={`unread-badge ${session.isMuted ? 'muted' : ''}`}>
                 {session.unreadCount > 99 ? '99+' : session.unreadCount}
               </span>
             )}
@@ -413,6 +414,7 @@ const SessionItem = React.memo(function SessionItem({
     prevProps.session.unreadCount === nextProps.session.unreadCount &&
     prevProps.session.lastTimestamp === nextProps.session.lastTimestamp &&
     prevProps.session.sortTimestamp === nextProps.session.sortTimestamp &&
+    prevProps.session.isMuted === nextProps.session.isMuted &&
     prevProps.isActive === nextProps.isActive
   )
 })
@@ -471,8 +473,8 @@ function ChatPage(props: ChatPageProps) {
   const sidebarRef = useRef<HTMLDivElement>(null)
 
   const getMessageKey = useCallback((msg: Message): string => {
-    if (msg.localId && msg.localId > 0) return `l:${msg.localId}`
-    return `t:${msg.createTime}:${msg.sortSeq || 0}:${msg.serverId || 0}`
+    if (msg.messageKey) return msg.messageKey
+    return `fallback:${msg.serverId || 0}:${msg.createTime}:${msg.sortSeq || 0}:${msg.localId || 0}:${msg.senderUsername || ''}:${msg.localType || 0}`
   }, [])
   const initialRevealTimerRef = useRef<number | null>(null)
   const sessionListRef = useRef<HTMLDivElement>(null)
@@ -537,7 +539,7 @@ function ChatPage(props: ChatPageProps) {
 
   // 多选模式
   const [isSelectionMode, setIsSelectionMode] = useState(false)
-  const [selectedMessages, setSelectedMessages] = useState<Set<number>>(new Set())
+  const [selectedMessages, setSelectedMessages] = useState<Set<string>>(new Set())
 
   // 编辑消息额外状态
   const [editMode, setEditMode] = useState<'raw' | 'fields'>('raw')
@@ -1896,14 +1898,16 @@ function ChatPage(props: ChatPageProps) {
         if (!status) return session
 
         const nextIsFolded = status.isFolded ?? session.isFolded
-        if (nextIsFolded === session.isFolded) {
+        const nextIsMuted = status.isMuted ?? session.isMuted
+        if (nextIsFolded === session.isFolded && nextIsMuted === session.isMuted) {
           return session
         }
 
         hasChanges = true
         return {
           ...session,
-          isFolded: nextIsFolded
+          isFolded: nextIsFolded,
+          isMuted: nextIsMuted
         }
       })
 
@@ -2353,6 +2357,7 @@ function ChatPage(props: ChatPageProps) {
         success: boolean;
         messages?: Message[];
         hasMore?: boolean;
+        nextOffset?: number;
         error?: string
       }
       if (options.switchRequestSeq && options.switchRequestSeq !== sessionSwitchRequestSeqRef.current) {
@@ -2429,7 +2434,10 @@ function ChatPage(props: ChatPageProps) {
             }
           }
         }
-        setCurrentOffset(offset + result.messages.length)
+        const nextOffset = typeof result.nextOffset === 'number'
+          ? result.nextOffset
+          : offset + result.messages.length
+        setCurrentOffset(nextOffset)
       } else if (!result.success) {
         setNoMessageTable(true)
         setHasMoreMessages(false)
@@ -3567,38 +3575,38 @@ function ChatPage(props: ChatPageProps) {
   const selectAllBatchImageDates = useCallback(() => setBatchImageSelectedDates(new Set(batchImageDates)), [batchImageDates])
   const clearAllBatchImageDates = useCallback(() => setBatchImageSelectedDates(new Set()), [])
 
-  const lastSelectedIdRef = useRef<number | null>(null)
+  const lastSelectedKeyRef = useRef<string | null>(null)
 
-  const handleToggleSelection = useCallback((localId: number, isShiftKey: boolean = false) => {
+  const handleToggleSelection = useCallback((messageKey: string, isShiftKey: boolean = false) => {
     setSelectedMessages(prev => {
       const next = new Set(prev)
 
       // Range selection with Shift key
-      if (isShiftKey && lastSelectedIdRef.current !== null && lastSelectedIdRef.current !== localId) {
+      if (isShiftKey && lastSelectedKeyRef.current !== null && lastSelectedKeyRef.current !== messageKey) {
         const currentMsgs = useChatStore.getState().messages || []
-        const idx1 = currentMsgs.findIndex(m => m.localId === lastSelectedIdRef.current)
-        const idx2 = currentMsgs.findIndex(m => m.localId === localId)
+        const idx1 = currentMsgs.findIndex(m => getMessageKey(m) === lastSelectedKeyRef.current)
+        const idx2 = currentMsgs.findIndex(m => getMessageKey(m) === messageKey)
 
         if (idx1 !== -1 && idx2 !== -1) {
           const start = Math.min(idx1, idx2)
           const end = Math.max(idx1, idx2)
           for (let i = start; i <= end; i++) {
-            next.add(currentMsgs[i].localId)
+            next.add(getMessageKey(currentMsgs[i]))
           }
         }
       } else {
         // Normal toggle
-        if (next.has(localId)) {
-          next.delete(localId)
-          lastSelectedIdRef.current = null // Reset last selection on uncheck? Or keep? Usually keep last interaction.
+        if (next.has(messageKey)) {
+          next.delete(messageKey)
+          lastSelectedKeyRef.current = null
         } else {
-          next.add(localId)
-          lastSelectedIdRef.current = localId
+          next.add(messageKey)
+          lastSelectedKeyRef.current = messageKey
         }
       }
       return next
     })
-  }, [])
+  }, [getMessageKey])
 
   const formatBatchDateLabel = useCallback((dateStr: string) => {
     const [y, m, d] = dateStr.split('-').map(Number)
@@ -3642,11 +3650,12 @@ function ChatPage(props: ChatPageProps) {
   // 执行单条删除动作
   const performSingleDelete = async (msg: Message) => {
     try {
-      const dbPathHint = (msg as any)._db_path
+      const targetMessageKey = getMessageKey(msg)
+      const dbPathHint = msg._db_path
       const result = await (window as any).electronAPI.chat.deleteMessage(currentSessionId, msg.localId, msg.createTime, dbPathHint)
       if (result.success) {
         const currentMessages = useChatStore.getState().messages || []
-        const newMessages = currentMessages.filter(m => m.localId !== msg.localId)
+        const newMessages = currentMessages.filter(m => getMessageKey(m) !== targetMessageKey)
         useChatStore.getState().setMessages(newMessages)
       } else {
         alert('删除失败: ' + (result.error || '原因未知'))
@@ -3708,7 +3717,7 @@ function ChatPage(props: ChatPageProps) {
         if (result.success) {
           const currentMessages = useChatStore.getState().messages || []
           const newMessages = currentMessages.map(m => {
-            if (m.localId === editingMessage.message.localId) {
+            if (getMessageKey(m) === getMessageKey(editingMessage.message)) {
               return { ...m, parsedContent: finalContent, content: finalContent, rawContent: finalContent }
             }
             return m
@@ -3749,37 +3758,44 @@ function ChatPage(props: ChatPageProps) {
 
     try {
       const currentMessages = useChatStore.getState().messages || []
-      const selectedIds = Array.from(selectedMessages)
-      const deletedIds = new Set<number>()
+      const selectedKeys = Array.from(selectedMessages)
+      const deletedKeys = new Set<string>()
 
-      for (let i = 0; i < selectedIds.length; i++) {
+      for (let i = 0; i < selectedKeys.length; i++) {
         if (cancelDeleteRef.current) break
 
-        const id = selectedIds[i]
-        const msgObj = currentMessages.find(m => m.localId === id)
-        const dbPathHint = (msgObj as any)?._db_path
+        const key = selectedKeys[i]
+        const msgObj = currentMessages.find(m => getMessageKey(m) === key)
+        const dbPathHint = msgObj?._db_path
         const createTime = msgObj?.createTime || 0
+        const localId = msgObj?.localId || 0
 
-        try {
-          const result = await (window as any).electronAPI.chat.deleteMessage(currentSessionId, id, createTime, dbPathHint)
-          if (result.success) {
-            deletedIds.add(id)
-          }
-        } catch (err) {
-          console.error(`删除消息 ${id} 失败:`, err)
+        if (!msgObj) {
+          setDeleteProgress({ current: i + 1, total: selectedKeys.length })
+          continue
         }
 
-        setDeleteProgress({ current: i + 1, total: selectedIds.length })
+        try {
+          const result = await (window as any).electronAPI.chat.deleteMessage(currentSessionId, localId, createTime, dbPathHint)
+          if (result.success) {
+            deletedKeys.add(key)
+          }
+        } catch (err) {
+          console.error(`删除消息 ${localId} 失败:`, err)
+        }
+
+        setDeleteProgress({ current: i + 1, total: selectedKeys.length })
       }
 
-      const finalMessages = (useChatStore.getState().messages || []).filter(m => !deletedIds.has(m.localId))
+      const finalMessages = (useChatStore.getState().messages || []).filter(m => !deletedKeys.has(getMessageKey(m)))
       useChatStore.getState().setMessages(finalMessages)
 
       setIsSelectionMode(false)
-      setSelectedMessages(new Set())
+      setSelectedMessages(new Set<string>())
+      lastSelectedKeyRef.current = null
 
       if (cancelDeleteRef.current) {
-        alert(`操作已中止。已删除 ${deletedIds.size} 条，剩余记录保留。`)
+        alert(`操作已中止。已删除 ${deletedKeys.size} 条，剩余记录保留。`)
       }
     } catch (e) {
       alert('批量删除出现错误: ' + String(e))
@@ -4234,7 +4250,8 @@ function ChatPage(props: ChatPageProps) {
                         onRequireModelDownload={handleRequireModelDownload}
                         onContextMenu={handleContextMenu}
                         isSelectionMode={isSelectionMode}
-                        isSelected={selectedMessages.has(msg.localId)}
+                        messageKey={messageKey}
+                        isSelected={selectedMessages.has(messageKey)}
                         onToggleSelection={handleToggleSelection}
                       />
                     </div>
@@ -4809,7 +4826,8 @@ function ChatPage(props: ChatPageProps) {
             </div>
             <div className="menu-item" onClick={() => {
               setIsSelectionMode(true)
-              setSelectedMessages(new Set([contextMenu.message.localId]))
+              setSelectedMessages(new Set<string>([getMessageKey(contextMenu.message)]))
+              lastSelectedKeyRef.current = getMessageKey(contextMenu.message)
               setContextMenu(null)
             }}>
               <CheckSquare size={16} />
@@ -5085,7 +5103,8 @@ function ChatPage(props: ChatPageProps) {
             className="btn-secondary"
             onClick={() => {
               setIsSelectionMode(false)
-              setSelectedMessages(new Set())
+              setSelectedMessages(new Set<string>())
+              lastSelectedKeyRef.current = null
             }}
             style={{
               padding: '6px 16px',
@@ -5163,6 +5182,7 @@ function QuotedEmoji({ cdnUrl, md5 }: { cdnUrl: string; md5?: string }) {
 // 消息气泡组件
 function MessageBubble({
   message,
+  messageKey,
   session,
   showTime,
   myAvatarUrl,
@@ -5174,6 +5194,7 @@ function MessageBubble({
   onToggleSelection
 }: {
   message: Message;
+  messageKey: string;
   session: ChatSession;
   showTime?: boolean;
   myAvatarUrl?: string;
@@ -5182,7 +5203,7 @@ function MessageBubble({
   onContextMenu?: (e: React.MouseEvent, message: Message) => void;
   isSelectionMode?: boolean;
   isSelected?: boolean;
-  onToggleSelection?: (localId: number, isShiftKey?: boolean) => void;
+  onToggleSelection?: (messageKey: string, isShiftKey?: boolean) => void;
 }) {
   const isSystem = isSystemMessage(message.localType)
   const isEmoji = message.localType === 47
@@ -5960,7 +5981,7 @@ function MessageBubble({
         onClick={(e) => {
           if (isSelectionMode) {
             e.stopPropagation()
-            onToggleSelection?.(message.localId, e.shiftKey)
+            onToggleSelection?.(messageKey, e.shiftKey)
           }
         }}
       >
@@ -7121,7 +7142,7 @@ function MessageBubble({
         onClick={(e) => {
           if (isSelectionMode) {
             e.stopPropagation()
-            onToggleSelection?.(message.localId, e.shiftKey)
+            onToggleSelection?.(messageKey, e.shiftKey)
           }
         }}
       >

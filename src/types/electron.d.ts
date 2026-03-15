@@ -183,12 +183,14 @@ export interface ElectronAPI {
       success: boolean;
       messages?: Message[];
       hasMore?: boolean;
+      nextOffset?: number;
       error?: string
     }>
     getLatestMessages: (sessionId: string, limit?: number) => Promise<{
       success: boolean
       messages?: Message[]
       hasMore?: boolean
+      nextOffset?: number
       error?: string
     }>
     getNewMessages: (sessionId: string, minTime: number, limit?: number) => Promise<{

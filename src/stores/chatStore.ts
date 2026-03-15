@@ -81,10 +81,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setMessages: (messages) => set({ messages }),
 
   appendMessages: (newMessages, prepend = false) => set((state) => {
-    // 强制去重逻辑
     const getMsgKey = (m: Message) => {
-      if (m.localId && m.localId > 0) return `l:${m.localId}`
-      return `t:${m.createTime}:${m.sortSeq || 0}:${m.serverId || 0}`
+      if (m.messageKey) return m.messageKey
+      return `fallback:${m.serverId || 0}:${m.createTime}:${m.sortSeq || 0}:${m.localId || 0}:${m.senderUsername || ''}:${m.localType || 0}`
     }
     const currentMessages = state.messages || []
     const existingKeys = new Set(currentMessages.map(getMsgKey))

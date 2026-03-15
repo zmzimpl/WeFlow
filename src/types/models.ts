@@ -41,6 +41,7 @@ export interface ContactInfo {
 
 // 消息
 export interface Message {
+  messageKey: string
   localId: number
   serverId: number
   localType: number
@@ -105,6 +106,7 @@ export interface Message {
   // 聊天记录
   chatRecordTitle?: string  // 聊天记录标题
   chatRecordList?: ChatRecordItem[]  // 聊天记录列表
+  _db_path?: string
 }
 
 // 聊天记录项
