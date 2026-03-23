@@ -96,12 +96,17 @@
       "icon": "public/icon.png",
       "target": [
         "appimage",
-        "deb",
         "tar.gz"
       ],
       "category": "Utility",
       "executableName": "weflow",
-      "synopsis": "WeFlow for Linux"
+      "synopsis": "WeFlow for Linux",
+      "extraFiles": [
+        {
+          "from": "resources/linux/install.sh",
+          "to": "install.sh"
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,

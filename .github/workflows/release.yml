@@ -190,7 +190,6 @@ jobs:
           fi
           WINDOWS_ARM64_ASSET="$(echo "$ASSETS_JSON" | jq -r '[.assets[].name | select(test("arm64.*\\.exe$"))][0] // ""')"
           MAC_ASSET="$(pick_asset "\\.dmg$")"
-          LINUX_DEB_ASSET="$(pick_asset "\\.deb$")"
           LINUX_TAR_ASSET="$(pick_asset "\\.tar\\.gz$")"
           LINUX_APPIMAGE_ASSET="$(pick_asset "\\.AppImage$")"
 
@@ -204,7 +203,6 @@ jobs:
           WINDOWS_URL="$(build_link "$WINDOWS_ASSET")"
           WINDOWS_ARM64_URL="$(build_link "$WINDOWS_ARM64_ASSET")"
           MAC_URL="$(build_link "$MAC_ASSET")"
-          LINUX_DEB_URL="$(build_link "$LINUX_DEB_ASSET")"
           LINUX_TAR_URL="$(build_link "$LINUX_TAR_ASSET")"
           LINUX_APPIMAGE_URL="$(build_link "$LINUX_APPIMAGE_ASSET")"
 
@@ -219,7 +217,6 @@ jobs:
           - Windows x64（Win10+）: ${WINDOWS_URL:-$RELEASE_PAGE}
           - Windows arm64: ${WINDOWS_ARM64_URL:-$RELEASE_PAGE}
           - macOS（M系列芯片）: ${MAC_URL:-$RELEASE_PAGE}
-          - Linux (.deb) (即将废弃): ${LINUX_DEB_URL:-$RELEASE_PAGE}
           - Linux (.tar.gz): ${LINUX_TAR_URL:-$RELEASE_PAGE}
           - linux (.AppImage): ${LINUX_APPIMAGE_URL:-$RELEASE_PAGE}
 
