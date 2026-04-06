@@ -427,17 +427,22 @@ class InsightService {
   // ── 沉默联系人扫描 ──────────────────────────────────────────────────────────
 
   private scheduleSilenceScan(): void {
-    this.silenceInitialDelayTimer = setTimeout(() => {
-      void this.runSilenceScan()
-      // 每次扫描完毕后重新读取间隔配置，允许用户动态调整不需要重启
-      const scheduleNext = () => {
-        const intervalHours = (this.config.get('aiInsightScanIntervalHours') as number) || 4
-        const intervalMs = Math.max(0.1, intervalHours) * 60 * 60 * 1000
-        insightLog('INFO', `下次沉默扫描将在 ${intervalHours} 小时后执行`)
-        this.silenceScanTimer = setTimeout(() => {
-          void this.runSilenceScan().then(scheduleNext)
-        }, intervalMs)
-      }
+    // 等待扫描完成后再安排下一次，避免并发堆积
+    const scheduleNext = () => {
+      if (!this.started) return
+      const intervalHours = (this.config.get('aiInsightScanIntervalHours') as number) || 4
+      const intervalMs = Math.max(0.1, intervalHours) * 60 * 60 * 1000
+      insightLog('INFO', `下次沉默扫描将在 ${intervalHours} 小时后执行`)
+      this.silenceScanTimer = setTimeout(async () => {
+        this.silenceScanTimer = null
+        await this.runSilenceScan()
+        scheduleNext()
+      }, intervalMs)
+    }
+
+    this.silenceInitialDelayTimer = setTimeout(async () => {
+      this.silenceInitialDelayTimer = null
+      await this.runSilenceScan()
       scheduleNext()
     }, SILENCE_SCAN_INITIAL_DELAY_MS)
   }
@@ -711,8 +716,9 @@ class InsightService {
         const telegramChatIds = (this.config.get('aiInsightTelegramChatIds') as string) || ''
         if (telegramToken && telegramChatIds) {
           const chatIds = telegramChatIds.split(',').map((s) => s.trim()).filter(Boolean)
+          const telegramText = `【WeFlow】 ${notifTitle}\n\n${insight}`
           for (const chatId of chatIds) {
-            this.sendTelegram(telegramToken, chatId, `${notifTitle}\n\n${insight}`).catch((e) => {
+            this.sendTelegram(telegramToken, chatId, telegramText).catch((e) => {
               insightLog('WARN', `Telegram 推送失败 (chatId=${chatId}): ${(e as Error).message}`)
             })
           }

@@ -1467,7 +1467,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       </div>
 
       <div className="form-group quote-layout-group">
-        <label>���用消息样式</label>
+        <label>引用消息样式</label>
         <span className="form-hint">选择聊天中引用消息与正文的上下顺序，下方预览会同步展示布局差异。</span>
         <div className="quote-layout-picker" role="radiogroup" aria-label="引用样式选择">
           {[
@@ -2825,6 +2825,10 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 2. 控制在 80 字以内，直接、具体、一针见血。不要废话。
 3. 输出纯文本，不使用 Markdown。
 4. 只有在完全没有任何可说的内容时（比如对话只有一条"嗯"），才回复"SKIP"。绝大多数情况下你应该输出见解。`
+
+        // 展示值：有自定义内容时显示自定义内容，否则显示默认值（可直接编辑）
+        const displayValue = aiInsightSystemPrompt || DEFAULT_SYSTEM_PROMPT
+
         return (
           <div className="form-group">
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
@@ -2833,6 +2837,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 className="button-secondary"
                 style={{ fontSize: 12, padding: '3px 10px' }}
                 onClick={async () => {
+                  // 恢复默认：清空自定义值，UI 回到显示默认内容的状态
                   setAiInsightSystemPrompt('')
                   await configService.setAiInsightSystemPrompt('')
                 }}
@@ -2841,16 +2846,16 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
               </button>
             </div>
             <span className="form-hint">
-              留空则使用内置默认提示词。修改后立即生效，无需重启。可变的统计信息（触发次数、对话内容）会自动附加在用户消息里，无需在此填写。
+              当前显示内置默认提示词，可直接编辑修改。修改后立即生效，无需重启。可变的统计信息（触发次数、对话内容）会自动附加在用户消息里，无需在此填写。
             </span>
             <textarea
               className="field-input"
               rows={8}
               style={{ width: '100%', resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
-              placeholder={DEFAULT_SYSTEM_PROMPT}
-              value={aiInsightSystemPrompt}
+              value={displayValue}
               onChange={(e) => {
                 const val = e.target.value
+                // 如果用户把内容改得和默认值一样，仍存自定义值（不影响功能）
                 setAiInsightSystemPrompt(val)
                 scheduleConfigSave('aiInsightSystemPrompt', () => configService.setAiInsightSystemPrompt(val))
               }}
@@ -3117,7 +3122,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             <p className="api-desc" style={{ lineHeight: 1.7 }}>
               <strong>触发方式一：活跃会话分析</strong> — 每当微信数据库变化（即你收到新消息）时，经过 500ms 防抖后，对最近活跃的私聊会话进行分析。<br />
               <strong>触发方式二：沉默扫描</strong> — 每 4 小时独立扫描一次，对超过阈值天数无消息的联系人发出提醒。<br />
-              <strong>时间观念</strong> — 每次调用时��AI 会收到今天已向该联系人和全局发出过多少次见解，由 AI 自行决定是否需要克制。<br />
+              <strong>时间观念</strong> — 每次调用时，AI 会收到今天已向该联系人和全局发出过多少次见解，由 AI 自行决定是否需要克制。<br />
               <strong>隐私</strong> — 所有分析请求均直接从你的电脑发往你填写的 API 地址，不经过任何 WeFlow 服务器。
             </p>
           </div>
