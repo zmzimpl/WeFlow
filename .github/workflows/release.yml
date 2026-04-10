@@ -31,28 +31,12 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
-      - name: Ensure mac key helpers are executable
-        shell: bash
-        run: |
-          set -euo pipefail
-          for file in \
-            resources/key/macos/universal/xkey_helper \
-            resources/key/macos/universal/image_scan_helper \
-            resources/key/macos/universal/xkey_helper_macos \
-            resources/key/macos/universal/libwx_key.dylib
-          do
-            if [ -f "$file" ]; then
-              chmod +x "$file"
-              ls -l "$file"
-            fi
-          done
-
       - name: Sync version with tag
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -109,7 +93,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -131,7 +115,7 @@ jobs:
           TAG=${GITHUB_REF_NAME}
           REPO=${{ github.repository }}
           MINIMUM_VERSION="4.1.7"
-          gh release download "$TAG" --repo "$REPO" --pattern "latest-linux.yml" --output "/tmp/latest-linux.yml" 2>/dev/null
+          gh release download "$TAG" --repo "$REPO" --pattern "latest-linux.yml" --output "/tmp/latest-linux.yml" 2>/dev/null || true
           if [ -f /tmp/latest-linux.yml ] && ! grep -q 'minimumVersion' /tmp/latest-linux.yml; then
             echo "minimumVersion: $MINIMUM_VERSION" >> /tmp/latest-linux.yml
             gh release upload "$TAG" --repo "$REPO" /tmp/latest-linux.yml --clobber
@@ -160,7 +144,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -182,7 +166,7 @@ jobs:
           TAG=${GITHUB_REF_NAME}
           REPO=${{ github.repository }}
           MINIMUM_VERSION="4.1.7"
-          gh release download "$TAG" --repo "$REPO" --pattern "latest.yml" --output "/tmp/latest.yml" 2>/dev/null
+          gh release download "$TAG" --repo "$REPO" --pattern "latest.yml" --output "/tmp/latest.yml" 2>/dev/null || true
           if [ -f /tmp/latest.yml ] && ! grep -q 'minimumVersion' /tmp/latest.yml; then
             echo "minimumVersion: $MINIMUM_VERSION" >> /tmp/latest.yml
             gh release upload "$TAG" --repo "$REPO" /tmp/latest.yml --clobber
@@ -211,7 +195,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -233,7 +217,7 @@ jobs:
           TAG=${GITHUB_REF_NAME}
           REPO=${{ github.repository }}
           MINIMUM_VERSION="4.1.7"
-          gh release download "$TAG" --repo "$REPO" --pattern "latest-arm64.yml" --output "/tmp/latest-arm64.yml" 2>/dev/null
+          gh release download "$TAG" --repo "$REPO" --pattern "latest-arm64.yml" --output "/tmp/latest-arm64.yml" 2>/dev/null || true
           if [ -f /tmp/latest-arm64.yml ] && ! grep -q 'minimumVersion' /tmp/latest-arm64.yml; then
             echo "minimumVersion: $MINIMUM_VERSION" >> /tmp/latest-arm64.yml
             gh release upload "$TAG" --repo "$REPO" /tmp/latest-arm64.yml --clobber
