@@ -4670,6 +4670,8 @@ class ChatService {
         case '57':
           // 引用消息，title 就是回复的内容
           return title
+        case '53':
+          return `[接龙] ${title.split(/\r?\n/).map(line => line.trim()).find(Boolean) || title}`
         case '2000':
           return `[转账] ${title}`
         case '2001':
@@ -4699,6 +4701,8 @@ class ChatService {
         return '[链接]'
       case '87':
         return '[群公告]'
+      case '53':
+        return '[接龙]'
       default:
         return '[消息]'
     }
@@ -5298,6 +5302,8 @@ class ChatService {
         const quoteInfo = this.parseQuoteMessage(content)
         result.quotedContent = quoteInfo.content
         result.quotedSender = quoteInfo.sender
+      } else if (xmlType === '53') {
+        result.appMsgKind = 'solitaire'
       } else if ((xmlType === '5' || xmlType === '49') && (sourceUsername?.startsWith('gh_') || appName?.includes('公众号') || sourceName)) {
         result.appMsgKind = 'official-link'
       } else if (url) {

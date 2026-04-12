@@ -181,6 +181,51 @@ function buildChatRecordPreviewItems(recordList: ChatRecordItem[], maxVisible = 
   ]
 }
 
+interface SolitaireEntry {
+  index: string
+  text: string
+}
+
+interface SolitaireContent {
+  title: string
+  introLines: string[]
+  entries: SolitaireEntry[]
+}
+
+function parseSolitaireContent(rawTitle: string): SolitaireContent {
+  const lines = String(rawTitle || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  const title = lines[0] || '接龙'
+  const introLines: string[] = []
+  const entries: SolitaireEntry[] = []
+  let hasStartedEntries = false
+
+  for (const line of lines.slice(1)) {
+    const entryMatch = /^(\d+)[.．、]\s*(.+)$/.exec(line)
+    if (entryMatch) {
+      hasStartedEntries = true
+      entries.push({
+        index: entryMatch[1],
+        text: entryMatch[2].trim()
+      })
+      continue
+    }
+
+    if (hasStartedEntries && entries.length > 0) {
+      const previous = entries[entries.length - 1]
+      previous.text = `${previous.text} ${line}`.trim()
+    } else {
+      introLines.push(line)
+    }
+  }
+
+  return { title, introLines, entries }
+}
+
 function composeGlobalMsgSearchResults(
   seedMap: Map<string, GlobalMsgSearchResult[]>,
   authoritativeMap: Map<string, GlobalMsgSearchResult[]>
@@ -7825,6 +7870,7 @@ function MessageBubble({
   const [senderName, setSenderName] = useState<string | undefined>(undefined)
   const [quotedSenderName, setQuotedSenderName] = useState<string | undefined>(undefined)
   const [quoteLayout, setQuoteLayout] = useState<QuoteLayout>('quote-top')
+  const [solitaireExpanded, setSolitaireExpanded] = useState(false)
   const senderProfileRequestSeqRef = useRef(0)
   const [emojiError, setEmojiError] = useState(false)
   const [emojiLoading, setEmojiLoading] = useState(false)
@@ -9430,6 +9476,71 @@ function MessageBubble({
             renderQuotedMessageBlock(renderReferContent()),
             <div className="message-text">{renderTextWithEmoji(cleanMessageContent(replyText))}</div>
           )
+        )
+      }
+
+      if (xmlType === '53' || message.appMsgKind === 'solitaire') {
+        const solitaireText = message.linkTitle || q('appmsg > title') || q('title') || cleanedParsedContent || '接龙'
+        const solitaire = parseSolitaireContent(solitaireText)
+        const previewEntries = solitaireExpanded ? solitaire.entries : solitaire.entries.slice(0, 3)
+        const hiddenEntryCount = Math.max(0, solitaire.entries.length - previewEntries.length)
+        const introLines = solitaireExpanded ? solitaire.introLines : solitaire.introLines.slice(0, 4)
+        const hasMoreIntro = !solitaireExpanded && solitaire.introLines.length > introLines.length
+        const countText = solitaire.entries.length > 0 ? `${solitaire.entries.length} 人参与` : '接龙消息'
+
+        return (
+          <div
+            className={`solitaire-message${solitaireExpanded ? ' expanded' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-expanded={solitaireExpanded}
+            onClick={isSelectionMode ? undefined : (e) => {
+              e.stopPropagation()
+              setSolitaireExpanded(value => !value)
+            }}
+            onKeyDown={isSelectionMode ? undefined : (e) => {
+              if (e.key !== 'Enter' && e.key !== ' ') return
+              e.preventDefault()
+              e.stopPropagation()
+              setSolitaireExpanded(value => !value)
+            }}
+            title={solitaireExpanded ? '点击收起接龙' : '点击展开接龙'}
+          >
+            <div className="solitaire-header">
+              <div className="solitaire-icon" aria-hidden="true">
+                <Hash size={18} />
+              </div>
+              <div className="solitaire-heading">
+                <div className="solitaire-title">{solitaire.title}</div>
+                <div className="solitaire-meta">{countText}</div>
+              </div>
+            </div>
+            {introLines.length > 0 && (
+              <div className="solitaire-intro">
+                {introLines.map((line, index) => (
+                  <div key={`${line}-${index}`} className="solitaire-intro-line">{line}</div>
+                ))}
+                {hasMoreIntro && <div className="solitaire-muted-line">...</div>}
+              </div>
+            )}
+            {previewEntries.length > 0 ? (
+              <div className="solitaire-entry-list">
+                {previewEntries.map(entry => (
+                  <div key={`${entry.index}-${entry.text}`} className="solitaire-entry">
+                    <span className="solitaire-entry-index">{entry.index}</span>
+                    <span className="solitaire-entry-text">{entry.text}</span>
+                  </div>
+                ))}
+                {hiddenEntryCount > 0 && (
+                  <div className="solitaire-muted-line">还有 {hiddenEntryCount} 条...</div>
+                )}
+              </div>
+            ) : null}
+            <div className="solitaire-footer">
+              <span>{solitaireExpanded ? '收起接龙' : '展开接龙'}</span>
+              <ChevronDown size={14} className="solitaire-chevron" />
+            </div>
+          </div>
         )
       }
 
