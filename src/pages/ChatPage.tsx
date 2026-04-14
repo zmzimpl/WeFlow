@@ -154,6 +154,21 @@ function hasRenderableChatRecordName(value?: string): boolean {
   return value !== undefined && value !== null && String(value).length > 0
 }
 
+function toRenderableImageSrc(path?: string): string | undefined {
+  const raw = String(path || '').trim()
+  if (!raw) return undefined
+  if (/^(data:|blob:|https?:|file:)/i.test(raw)) return raw
+
+  const normalized = raw.replace(/\\/g, '/')
+  if (/^[a-zA-Z]:\//.test(normalized)) {
+    return encodeURI(`file:///${normalized}`)
+  }
+  if (normalized.startsWith('/')) {
+    return encodeURI(`file://${normalized}`)
+  }
+  return raw
+}
+
 function getChatRecordPreviewText(item: ChatRecordItem): string {
   const text = normalizeChatRecordText(item.datadesc) || normalizeChatRecordText(item.datatitle)
   if (item.datatype === 17) {
@@ -4853,7 +4868,7 @@ function ChatPage(props: ChatPageProps) {
     const candidates = [...head, ...tail]
     const queued = preloadImageKeysRef.current
     const seen = new Set<string>()
-    const payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }> = []
+    const payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }> = []
     for (const msg of candidates) {
       if (payloads.length >= maxPreload) break
       if (msg.localType !== 3) continue
@@ -4867,11 +4882,14 @@ function ChatPage(props: ChatPageProps) {
       payloads.push({
         sessionId: currentSessionId,
         imageMd5: msg.imageMd5 || undefined,
-        imageDatName: msg.imageDatName
+        imageDatName: msg.imageDatName,
+        createTime: msg.createTime
       })
     }
     if (payloads.length > 0) {
-      window.electronAPI.image.preload(payloads).catch(() => { })
+      window.electronAPI.image.preload(payloads, {
+        allowCacheIndex: false
+      }).catch(() => { })
     }
   }, [currentSessionId, messages])
 
@@ -5840,7 +5858,10 @@ function ChatPage(props: ChatPageProps) {
           sessionId: session.username,
           imageMd5: img.imageMd5,
           imageDatName: img.imageDatName,
-          force: true
+          createTime: img.createTime,
+          force: true,
+          preferFilePath: true,
+          hardlinkOnly: true
         })
         if (r?.success) successCount++
         else failCount++
@@ -7882,7 +7903,7 @@ function MessageBubble({
   )
   const imageCacheKey = message.imageMd5 || message.imageDatName || `local:${message.localId}`
   const [imageLocalPath, setImageLocalPath] = useState<string | undefined>(
-    () => imageDataUrlCache.get(imageCacheKey)
+    () => toRenderableImageSrc(imageDataUrlCache.get(imageCacheKey))
   )
   const voiceIdentityKey = buildVoiceCacheIdentity(session.username, message)
   const voiceCacheKey = `voice:${voiceIdentityKey}`
@@ -7904,6 +7925,7 @@ function MessageBubble({
   const imageUpdateCheckedRef = useRef<string | null>(null)
   const imageClickTimerRef = useRef<number | null>(null)
   const imageContainerRef = useRef<HTMLDivElement>(null)
+  const imageElementRef = useRef<HTMLImageElement | null>(null)
   const emojiContainerRef = useRef<HTMLDivElement>(null)
   const imageResizeBaselineRef = useRef<number | null>(null)
   const emojiResizeBaselineRef = useRef<number | null>(null)
@@ -8260,19 +8282,27 @@ function MessageBubble({
             sessionId: session.username,
             imageMd5: message.imageMd5 || undefined,
             imageDatName: message.imageDatName,
-            force: forceUpdate
+            createTime: message.createTime,
+            force: forceUpdate,
+            preferFilePath: true,
+            hardlinkOnly: true
           }) as SharedImageDecryptResult
         })
         if (result.success && result.localPath) {
-          imageDataUrlCache.set(imageCacheKey, result.localPath)
-          if (imageLocalPath !== result.localPath) {
+          const renderPath = toRenderableImageSrc(result.localPath)
+          if (!renderPath) {
+            if (!silent) setImageError(true)
+            return { success: false }
+          }
+          imageDataUrlCache.set(imageCacheKey, renderPath)
+          if (imageLocalPath !== renderPath) {
             captureImageResizeBaseline()
             lockImageStageHeight()
           }
-          setImageLocalPath(result.localPath)
+          setImageLocalPath(renderPath)
           setImageHasUpdate(false)
           if (result.liveVideoPath) setImageLiveVideoPath(result.liveVideoPath)
-          return result
+          return { ...result, localPath: renderPath }
         }
       }
 
@@ -8297,7 +8327,7 @@ function MessageBubble({
       imageDecryptPendingRef.current = false
     }
     return { success: false }
-  }, [isImage, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline, lockImageStageHeight])
+  }, [isImage, message.imageMd5, message.imageDatName, message.createTime, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline, lockImageStageHeight])
 
   const triggerForceHd = useCallback(() => {
     if (!message.imageMd5 && !message.imageDatName) return
@@ -8352,24 +8382,29 @@ function MessageBubble({
         const resolved = await window.electronAPI.image.resolveCache({
           sessionId: session.username,
           imageMd5: message.imageMd5 || undefined,
-          imageDatName: message.imageDatName
+          imageDatName: message.imageDatName,
+          createTime: message.createTime,
+          preferFilePath: true,
+          hardlinkOnly: true
         })
         if (resolved?.success && resolved.localPath) {
-          finalImagePath = resolved.localPath
+          const renderPath = toRenderableImageSrc(resolved.localPath)
+          if (!renderPath) return
+          finalImagePath = renderPath
           finalLiveVideoPath = resolved.liveVideoPath || finalLiveVideoPath
-          imageDataUrlCache.set(imageCacheKey, resolved.localPath)
-          if (imageLocalPath !== resolved.localPath) {
+          imageDataUrlCache.set(imageCacheKey, renderPath)
+          if (imageLocalPath !== renderPath) {
             captureImageResizeBaseline()
             lockImageStageHeight()
           }
-          setImageLocalPath(resolved.localPath)
+          setImageLocalPath(renderPath)
           if (resolved.liveVideoPath) setImageLiveVideoPath(resolved.liveVideoPath)
           setImageHasUpdate(Boolean(resolved.hasUpdate))
         }
       } catch { }
     }
 
-    void window.electronAPI.window.openImageViewerWindow(finalImagePath, finalLiveVideoPath)
+    void window.electronAPI.window.openImageViewerWindow(toRenderableImageSrc(finalImagePath) || finalImagePath, finalLiveVideoPath)
   }, [
     imageLiveVideoPath,
     imageLocalPath,
@@ -8378,6 +8413,7 @@ function MessageBubble({
     lockImageStageHeight,
     message.imageDatName,
     message.imageMd5,
+    message.createTime,
     requestImageDecrypt,
     session.username
   ])
@@ -8391,8 +8427,19 @@ function MessageBubble({
   }, [])
 
   useEffect(() => {
-    setImageLoaded(false)
-  }, [imageLocalPath])
+    if (!isImage) return
+    if (!imageLocalPath) {
+      setImageLoaded(false)
+      return
+    }
+
+    // 某些 file:// 缓存图在 src 切换时可能不会稳定触发 onLoad，
+    // 这里用 complete/naturalWidth 做一次兜底，避免图片进入 pending 隐身态。
+    const img = imageElementRef.current
+    if (img && img.complete && img.naturalWidth > 0) {
+      setImageLoaded(true)
+    }
+  }, [isImage, imageLocalPath])
 
   useEffect(() => {
     if (imageLoading) return
@@ -8401,7 +8448,7 @@ function MessageBubble({
   }, [imageError, imageLoading, imageLocalPath])
 
   useEffect(() => {
-    if (!isImage || imageLoading) return
+    if (!isImage || imageLoading || !imageInView) return
     if (!message.imageMd5 && !message.imageDatName) return
     if (imageUpdateCheckedRef.current === imageCacheKey) return
     imageUpdateCheckedRef.current = imageCacheKey
@@ -8409,15 +8456,21 @@ function MessageBubble({
     window.electronAPI.image.resolveCache({
       sessionId: session.username,
       imageMd5: message.imageMd5 || undefined,
-      imageDatName: message.imageDatName
+      imageDatName: message.imageDatName,
+      createTime: message.createTime,
+      preferFilePath: true,
+      hardlinkOnly: true,
+      allowCacheIndex: false
     }).then((result: { success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string }) => {
       if (cancelled) return
       if (result.success && result.localPath) {
-        imageDataUrlCache.set(imageCacheKey, result.localPath)
-        if (!imageLocalPath || imageLocalPath !== result.localPath) {
+        const renderPath = toRenderableImageSrc(result.localPath)
+        if (!renderPath) return
+        imageDataUrlCache.set(imageCacheKey, renderPath)
+        if (!imageLocalPath || imageLocalPath !== renderPath) {
           captureImageResizeBaseline()
           lockImageStageHeight()
-          setImageLocalPath(result.localPath)
+          setImageLocalPath(renderPath)
           setImageError(false)
         }
         if (result.liveVideoPath) setImageLiveVideoPath(result.liveVideoPath)
@@ -8427,7 +8480,7 @@ function MessageBubble({
     return () => {
       cancelled = true
     }
-  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username, captureImageResizeBaseline, lockImageStageHeight])
+  }, [isImage, imageInView, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, message.createTime, imageCacheKey, session.username, captureImageResizeBaseline, lockImageStageHeight])
 
   useEffect(() => {
     if (!isImage) return
@@ -8455,15 +8508,17 @@ function MessageBubble({
         (payload.imageMd5 && payload.imageMd5 === message.imageMd5) ||
         (payload.imageDatName && payload.imageDatName === message.imageDatName)
       if (matchesCacheKey) {
+        const renderPath = toRenderableImageSrc(payload.localPath)
+        if (!renderPath) return
         const cachedPath = imageDataUrlCache.get(imageCacheKey)
-        if (cachedPath !== payload.localPath) {
-          imageDataUrlCache.set(imageCacheKey, payload.localPath)
+        if (cachedPath !== renderPath) {
+          imageDataUrlCache.set(imageCacheKey, renderPath)
         }
-        if (imageLocalPath !== payload.localPath) {
+        if (imageLocalPath !== renderPath) {
           captureImageResizeBaseline()
           lockImageStageHeight()
         }
-        setImageLocalPath((prev) => (prev === payload.localPath ? prev : payload.localPath))
+        setImageLocalPath((prev) => (prev === renderPath ? prev : renderPath))
         setImageError(false)
       }
     })
@@ -9093,6 +9148,7 @@ function MessageBubble({
             <>
               <div className="image-message-wrapper">
                 <img
+                  ref={imageElementRef}
                   src={imageLocalPath}
                   alt="图片"
                   className={`image-message ${imageLoaded ? 'ready' : 'pending'}`}

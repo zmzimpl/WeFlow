@@ -37,7 +37,6 @@ export const CONFIG_KEYS = {
   EXPORT_DEFAULT_EXCEL_COMPACT_COLUMNS: 'exportDefaultExcelCompactColumns',
   EXPORT_DEFAULT_TXT_COLUMNS: 'exportDefaultTxtColumns',
   EXPORT_DEFAULT_CONCURRENCY: 'exportDefaultConcurrency',
-  EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS: 'exportDefaultImageDeepSearchOnMiss',
   EXPORT_WRITE_LAYOUT: 'exportWriteLayout',
   EXPORT_SESSION_NAME_PREFIX_ENABLED: 'exportSessionNamePrefixEnabled',
   EXPORT_LAST_SESSION_RUN_MAP: 'exportLastSessionRunMap',
@@ -546,18 +545,6 @@ export async function getExportDefaultConcurrency(): Promise<number | null> {
 // 设置导出默认并发数
 export async function setExportDefaultConcurrency(concurrency: number): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_CONCURRENCY, concurrency)
-}
-
-// 获取缺图时是否深度搜索（默认导出行为）
-export async function getExportDefaultImageDeepSearchOnMiss(): Promise<boolean | null> {
-  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS)
-  if (typeof value === 'boolean') return value
-  return null
-}
-
-// 设置缺图时是否深度搜索（默认导出行为）
-export async function setExportDefaultImageDeepSearchOnMiss(enabled: boolean): Promise<void> {
-  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS, enabled)
 }
 
 export type ExportWriteLayout = 'A' | 'B' | 'C'

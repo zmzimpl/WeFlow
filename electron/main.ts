@@ -2636,13 +2636,24 @@ function registerIpcHandlers() {
   // 私聊克隆
 
 
-  ipcMain.handle('image:decrypt', async (_, payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => {
+  ipcMain.handle('image:decrypt', async (_, payload: {
+    sessionId?: string
+    imageMd5?: string
+    imageDatName?: string
+    createTime?: number
+    force?: boolean
+    preferFilePath?: boolean
+    hardlinkOnly?: boolean
+  }) => {
     return imageDecryptService.decryptImage(payload)
   })
   ipcMain.handle('image:resolveCache', async (_, payload: {
     sessionId?: string
     imageMd5?: string
     imageDatName?: string
+    createTime?: number
+    preferFilePath?: boolean
+    hardlinkOnly?: boolean
     disableUpdateCheck?: boolean
     allowCacheIndex?: boolean
   }) => {
@@ -2652,13 +2663,15 @@ function registerIpcHandlers() {
     'image:resolveCacheBatch',
     async (
       _,
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; preferFilePath?: boolean; hardlinkOnly?: boolean }>,
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean; preferFilePath?: boolean; hardlinkOnly?: boolean }
     ) => {
       const list = Array.isArray(payloads) ? payloads : []
       const rows = await Promise.all(list.map(async (payload) => {
         return imageDecryptService.resolveCachedImage({
           ...payload,
+          preferFilePath: payload.preferFilePath ?? options?.preferFilePath === true,
+          hardlinkOnly: payload.hardlinkOnly ?? options?.hardlinkOnly === true,
           disableUpdateCheck: options?.disableUpdateCheck === true,
           allowCacheIndex: options?.allowCacheIndex !== false
         })
@@ -2670,7 +2683,7 @@ function registerIpcHandlers() {
     'image:preload',
     async (
       _,
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }>,
       options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
     ) => {
     imagePreloadService.enqueue(payloads || [], options)

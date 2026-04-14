@@ -105,7 +105,6 @@ interface ExportOptions {
   txtColumns: string[]
   displayNamePreference: DisplayNamePreference
   exportConcurrency: number
-  imageDeepSearchOnMiss: boolean
 }
 
 interface SessionRow extends AppChatSession {
@@ -335,6 +334,15 @@ const createEmptyTaskPerformance = (): TaskPerformance => ({
 const isTextBatchTask = (task: ExportTask): boolean => (
   task.payload.scope === 'content' && task.payload.contentType === 'text'
 )
+
+const isImageExportTask = (task: ExportTask): boolean => {
+  if (task.payload.scope === 'sns') {
+    return Boolean(task.payload.snsOptions?.exportImages)
+  }
+  if (task.payload.scope !== 'content') return false
+  if (task.payload.contentType === 'image') return true
+  return Boolean(task.payload.options?.exportImages)
+}
 
 const resolvePerfStageByPhase = (phase?: ExportProgress['phase']): TaskPerfStage => {
   if (phase === 'preparing') return 'collect'
@@ -1705,6 +1713,24 @@ const TaskCenterModal = memo(function TaskCenterModal({
                 const currentSessionRatio = task.progress.phaseTotal > 0
                   ? Math.max(0, Math.min(1, task.progress.phaseProgress / task.progress.phaseTotal))
                   : null
+                const imageTask = isImageExportTask(task)
+                const imageTimingElapsedMs = imageTask
+                  ? Math.max(0, (
+                    typeof task.finishedAt === 'number'
+                      ? task.finishedAt
+                      : nowTick
+                  ) - (task.startedAt || task.createdAt))
+                  : 0
+                const imageTimingAvgMs = imageTask && mediaDoneFiles > 0
+                  ? Math.floor(imageTimingElapsedMs / Math.max(1, mediaDoneFiles))
+                  : 0
+                const imageTimingLabel = imageTask
+                  ? (
+                    mediaDoneFiles > 0
+                      ? `图片耗时 ${formatDurationMs(imageTimingElapsedMs)} · 平均 ${imageTimingAvgMs}ms/张`
+                      : `图片耗时 ${formatDurationMs(imageTimingElapsedMs)}`
+                  )
+                  : ''
                 return (
                   <div key={task.id} className={`task-card ${task.status}`}>
                     <div className="task-main">
@@ -1733,6 +1759,11 @@ const TaskCenterModal = memo(function TaskCenterModal({
                             {task.progress.phaseLabel ? ` · ${task.progress.phaseLabel}` : ''}
                           </div>
                         </>
+                      )}
+                      {imageTimingLabel && task.status !== 'queued' && (
+                        <div className="task-perf-summary">
+                          <span>{imageTimingLabel}</span>
+                        </div>
                       )}
                       {canShowPerfDetail && stageTotals && (
                         <div className="task-perf-summary">
@@ -1903,7 +1934,6 @@ function ExportPage() {
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
   const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
-  const [exportDefaultImageDeepSearchOnMiss, setExportDefaultImageDeepSearchOnMiss] = useState(true)
 
   const [options, setOptions] = useState<ExportOptions>({
     format: 'json',
@@ -1924,8 +1954,7 @@ function ExportPage() {
     excelCompactColumns: true,
     txtColumns: defaultTxtColumns,
     displayNamePreference: 'remark',
-    exportConcurrency: 2,
-    imageDeepSearchOnMiss: true
+    exportConcurrency: 2
   })
 
   const [exportDialog, setExportDialog] = useState<ExportDialogState>({
@@ -2622,7 +2651,7 @@ function ExportPage() {
     automationTasksReadyRef.current = false
     let isReady = true
     try {
-      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedImageDeepSearchOnMiss, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, savedFileNamingMode, exportCacheScope] = await Promise.all([
+      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, savedFileNamingMode, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultAvatars(),
@@ -2631,7 +2660,6 @@ function ExportPage() {
         configService.getExportDefaultExcelCompactColumns(),
         configService.getExportDefaultTxtColumns(),
         configService.getExportDefaultConcurrency(),
-        configService.getExportDefaultImageDeepSearchOnMiss(),
         configService.getExportLastSessionRunMap(),
         configService.getExportLastContentRunMap(),
         configService.getExportSessionRecordMap(),
@@ -2671,7 +2699,6 @@ function ExportPage() {
       setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
       setExportDefaultConcurrency(savedConcurrency ?? 2)
-      setExportDefaultImageDeepSearchOnMiss(savedImageDeepSearchOnMiss ?? true)
       setExportDefaultFileNamingMode(savedFileNamingMode ?? 'classic')
       setAutomationTasks(automationTaskItem?.tasks || [])
       automationTasksReadyRef.current = true
@@ -2709,8 +2736,7 @@ function ExportPage() {
         exportVoiceAsText: savedVoiceAsText ?? prev.exportVoiceAsText,
         excelCompactColumns: savedExcelCompactColumns ?? prev.excelCompactColumns,
         txtColumns,
-        exportConcurrency: savedConcurrency ?? prev.exportConcurrency,
-        imageDeepSearchOnMiss: savedImageDeepSearchOnMiss ?? prev.imageDeepSearchOnMiss
+        exportConcurrency: savedConcurrency ?? prev.exportConcurrency
       }))
     } catch (error) {
       isReady = false
@@ -4491,8 +4517,7 @@ function ExportPage() {
         maxFileSizeMb: prev.maxFileSizeMb,
         exportVoiceAsText: exportDefaultVoiceAsText,
         excelCompactColumns: exportDefaultExcelCompactColumns,
-        exportConcurrency: exportDefaultConcurrency,
-        imageDeepSearchOnMiss: exportDefaultImageDeepSearchOnMiss
+        exportConcurrency: exportDefaultConcurrency
       }
 
       if (payload.scope === 'sns') {
@@ -4527,8 +4552,7 @@ function ExportPage() {
     exportDefaultAvatars,
     exportDefaultMedia,
     exportDefaultVoiceAsText,
-    exportDefaultConcurrency,
-    exportDefaultImageDeepSearchOnMiss
+    exportDefaultConcurrency
   ])
 
   const closeExportDialog = useCallback(() => {
@@ -4755,7 +4779,6 @@ function ExportPage() {
       txtColumns: options.txtColumns,
       displayNamePreference: options.displayNamePreference,
       exportConcurrency: options.exportConcurrency,
-      imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
       fileNamingMode: exportDefaultFileNamingMode,
       sessionLayout,
       sessionNameWithTypePrefix,
@@ -5691,8 +5714,6 @@ function ExportPage() {
     await configService.setExportDefaultExcelCompactColumns(options.excelCompactColumns)
     await configService.setExportDefaultTxtColumns(options.txtColumns)
     await configService.setExportDefaultConcurrency(options.exportConcurrency)
-    await configService.setExportDefaultImageDeepSearchOnMiss(options.imageDeepSearchOnMiss)
-    setExportDefaultImageDeepSearchOnMiss(options.imageDeepSearchOnMiss)
   }
 
   const openSingleExport = useCallback((session: SessionRow) => {
@@ -7393,14 +7414,6 @@ function ExportPage() {
   const useCollapsedSessionFormatSelector = isSessionScopeDialog || isContentTextDialog
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
-  const shouldRenderImageDeepSearchToggle = exportDialog.scope !== 'sns' && (
-    isSessionScopeDialog ||
-    (isContentScopeDialog && exportDialog.contentType === 'image')
-  )
-  const shouldShowImageDeepSearchToggle = exportDialog.scope !== 'sns' && (
-    (isSessionScopeDialog && options.exportImages) ||
-    (isContentScopeDialog && exportDialog.contentType === 'image')
-  )
   const avatarExportStatusLabel = options.exportAvatars ? '已开启聊天消息导出带头像' : '已关闭聊天消息导出带头像'
   const contentTextDialogSummary = '此模式只导出聊天文本，不包含图片语音视频表情包等多媒体文件。'
   const activeDialogFormatLabel = exportDialog.scope === 'sns'
@@ -9707,30 +9720,6 @@ function ExportPage() {
                       </div>
                     </div>
                   )}
-                </div>
-              )}
-
-              {shouldRenderImageDeepSearchToggle && (
-                <div className={`dialog-collapse-slot ${shouldShowImageDeepSearchToggle ? 'open' : ''}`} aria-hidden={!shouldShowImageDeepSearchToggle}>
-                  <div className="dialog-collapse-inner">
-                    <div className="dialog-section">
-                      <div className="dialog-switch-row">
-                        <div className="dialog-switch-copy">
-                          <h4>缺图时深度搜索</h4>
-                          <div className="format-note">关闭后仅尝试 hardlink 命中，未命中将直接显示占位符，导出速度更快。</div>
-                        </div>
-                        <button
-                          type="button"
-                          className={`dialog-switch ${options.imageDeepSearchOnMiss ? 'on' : ''}`}
-                          aria-pressed={options.imageDeepSearchOnMiss}
-                          aria-label="切换缺图时深度搜索"
-                          onClick={() => setOptions(prev => ({ ...prev, imageDeepSearchOnMiss: !prev.imageDeepSearchOnMiss }))}
-                        >
-                          <span className="dialog-switch-thumb" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
                 </div>
               )}
 

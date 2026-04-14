@@ -3,10 +3,11 @@ import { basename, dirname, extname, join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, appendFileSync } from 'fs'
 import { writeFile, rm, readdir } from 'fs/promises'
+import { homedir, tmpdir } from 'os'
 import crypto from 'crypto'
-import { Worker } from 'worker_threads'
 import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
+import { decryptDatViaNative, nativeAddonLocation } from './nativeImageDecrypt'
 
 // 获取 ffmpeg-static 的路径
 function getStaticFfmpegPath(): string | null {
@@ -34,7 +35,7 @@ function getStaticFfmpegPath(): string | null {
     }
 
     // 方法3: 打包后的路径
-    if (app.isPackaged) {
+    if (app?.isPackaged) {
       const resourcesPath = process.resourcesPath
       const packedPath = join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
       if (existsSync(packedPath)) {
@@ -61,24 +62,25 @@ type CachedImagePayload = {
   sessionId?: string
   imageMd5?: string
   imageDatName?: string
+  createTime?: number
   preferFilePath?: boolean
+  hardlinkOnly?: boolean
   disableUpdateCheck?: boolean
   allowCacheIndex?: boolean
 }
 
 type DecryptImagePayload = CachedImagePayload & {
   force?: boolean
-  hardlinkOnly?: boolean
 }
 
 export class ImageDecryptService {
   private configService = new ConfigService()
   private resolvedCache = new Map<string, string>()
   private pending = new Map<string, Promise<DecryptResult>>()
-  private readonly defaultV1AesKey = 'cfcd208495d565ef'
-  private cacheIndexed = false
-  private cacheIndexing: Promise<void> | null = null
   private updateFlags = new Map<string, boolean>()
+  private nativeLogged = false
+  private datNameScanMissAt = new Map<string, number>()
+  private readonly datNameScanMissTtlMs = 1200
 
   private logInfo(message: string, meta?: Record<string, unknown>): void {
     if (!this.configService.get('logEnabled')) return
@@ -106,7 +108,7 @@ export class ImageDecryptService {
 
   private writeLog(line: string): void {
     try {
-      const logDir = join(app.getPath('userData'), 'logs')
+      const logDir = join(this.getUserDataPath(), 'logs')
       if (!existsSync(logDir)) {
         mkdirSync(logDir, { recursive: true })
       }
@@ -117,9 +119,6 @@ export class ImageDecryptService {
   }
 
   async resolveCachedImage(payload: CachedImagePayload): Promise<DecryptResult & { hasUpdate?: boolean }> {
-    if (payload.allowCacheIndex !== false) {
-      await this.ensureCacheIndexed()
-    }
     const cacheKeys = this.getCacheKeys(payload)
     const cacheKey = cacheKeys[0]
     if (!cacheKey) {
@@ -128,17 +127,21 @@ export class ImageDecryptService {
     for (const key of cacheKeys) {
       const cached = this.resolvedCache.get(key)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
-        const isThumb = this.isThumbnailPath(cached)
+        const upgraded = this.isThumbnailPath(cached)
+          ? await this.tryPromoteThumbnailCache(payload, key, cached)
+          : null
+        const finalPath = upgraded || cached
+        const localPath = this.resolveLocalPathForPayload(finalPath, payload.preferFilePath)
+        const isThumb = this.isThumbnailPath(finalPath)
         const hasUpdate = isThumb ? (this.updateFlags.get(key) ?? false) : false
         if (isThumb) {
           if (!payload.disableUpdateCheck) {
-            this.triggerUpdateCheck(payload, key, cached)
+            this.triggerUpdateCheck(payload, key, finalPath)
           }
         } else {
           this.updateFlags.delete(key)
         }
-        this.emitCacheResolved(payload, key, this.resolveEmitPath(cached, payload.preferFilePath))
+        this.emitCacheResolved(payload, key, this.resolveEmitPath(finalPath, payload.preferFilePath))
         return { success: true, localPath, hasUpdate }
       }
       if (cached && !this.isImageFile(cached)) {
@@ -146,22 +149,41 @@ export class ImageDecryptService {
       }
     }
 
-    for (const key of cacheKeys) {
-      const existing = this.findCachedOutput(key, false, payload.sessionId)
-      if (existing) {
-        this.cacheResolvedPaths(key, payload.imageMd5, payload.imageDatName, existing)
-        const localPath = this.resolveLocalPathForPayload(existing, payload.preferFilePath)
-        const isThumb = this.isThumbnailPath(existing)
-        const hasUpdate = isThumb ? (this.updateFlags.get(key) ?? false) : false
-        if (isThumb) {
-          if (!payload.disableUpdateCheck) {
-            this.triggerUpdateCheck(payload, key, existing)
-          }
-        } else {
-          this.updateFlags.delete(key)
+    const accountDir = this.resolveCurrentAccountDir()
+    if (accountDir) {
+      const datPath = await this.resolveDatPath(
+        accountDir,
+        payload.imageMd5,
+        payload.imageDatName,
+        payload.sessionId,
+        payload.createTime,
+        {
+          allowThumbnail: true,
+          skipResolvedCache: false,
+          hardlinkOnly: true
         }
-        this.emitCacheResolved(payload, key, this.resolveEmitPath(existing, payload.preferFilePath))
-        return { success: true, localPath, hasUpdate }
+      )
+      if (datPath) {
+        const existing = this.findCachedOutputByDatPath(datPath, payload.sessionId, false)
+        if (existing) {
+          const upgraded = this.isThumbnailPath(existing)
+            ? await this.tryPromoteThumbnailCache(payload, cacheKey, existing)
+            : null
+          const finalPath = upgraded || existing
+          this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, finalPath)
+          const localPath = this.resolveLocalPathForPayload(finalPath, payload.preferFilePath)
+          const isThumb = this.isThumbnailPath(finalPath)
+          const hasUpdate = isThumb ? (this.updateFlags.get(cacheKey) ?? false) : false
+          if (isThumb) {
+            if (!payload.disableUpdateCheck) {
+              this.triggerUpdateCheck(payload, cacheKey, finalPath)
+            }
+          } else {
+            this.updateFlags.delete(cacheKey)
+          }
+          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(finalPath, payload.preferFilePath))
+          return { success: true, localPath, hasUpdate }
+        }
       }
     }
     this.logInfo('未找到缓存', { md5: payload.imageMd5, datName: payload.imageDatName })
@@ -169,9 +191,6 @@ export class ImageDecryptService {
   }
 
   async decryptImage(payload: DecryptImagePayload): Promise<DecryptResult> {
-    if (!payload.hardlinkOnly) {
-      await this.ensureCacheIndexed()
-    }
     const cacheKeys = this.getCacheKeys(payload)
     const cacheKey = cacheKeys[0]
     if (!cacheKey) {
@@ -195,25 +214,17 @@ export class ImageDecryptService {
         }
       }
 
-      if (!payload.hardlinkOnly) {
-        for (const key of cacheKeys) {
-          const existingHd = this.findCachedOutput(key, true, payload.sessionId)
-          if (!existingHd || this.isThumbnailPath(existingHd)) continue
-          this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existingHd)
-          this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
-          const localPath = this.resolveLocalPathForPayload(existingHd, payload.preferFilePath)
-          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existingHd, payload.preferFilePath))
-          this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
-          return { success: true, localPath }
-        }
-      }
     }
 
     if (!payload.force) {
       const cached = this.resolvedCache.get(cacheKey)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
-        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(cached, payload.preferFilePath))
+        const upgraded = this.isThumbnailPath(cached)
+          ? await this.tryPromoteThumbnailCache(payload, cacheKey, cached)
+          : null
+        const finalPath = upgraded || cached
+        const localPath = this.resolveLocalPathForPayload(finalPath, payload.preferFilePath)
+        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(finalPath, payload.preferFilePath))
         this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
         return { success: true, localPath }
       }
@@ -260,13 +271,13 @@ export class ImageDecryptService {
       for (const row of result.rows) {
         const md5 = String(row?.md5 || '').trim().toLowerCase()
         if (!md5) continue
-        const fullPath = String(row?.data?.full_path || '').trim()
-        if (!fullPath || !existsSync(fullPath)) continue
-        this.cacheDatPath(accountDir, md5, fullPath)
         const fileName = String(row?.data?.file_name || '').trim().toLowerCase()
-        if (fileName) {
-          this.cacheDatPath(accountDir, fileName, fullPath)
-        }
+        const fullPath = String(row?.data?.full_path || '').trim()
+        if (!fileName || !fullPath) continue
+        const selectedPath = this.normalizeHardlinkDatPathByFileName(fullPath, fileName)
+        if (!selectedPath || !existsSync(selectedPath)) continue
+        this.cacheDatPath(accountDir, md5, selectedPath)
+        this.cacheDatPath(accountDir, fileName, selectedPath)
       }
     } catch {
       // ignore preload failures
@@ -307,6 +318,7 @@ export class ImageDecryptService {
           payload.imageMd5,
           payload.imageDatName,
           payload.sessionId,
+          payload.createTime,
           {
             allowThumbnail: false,
             skipResolvedCache: true,
@@ -319,6 +331,7 @@ export class ImageDecryptService {
             payload.imageMd5,
             payload.imageDatName,
             payload.sessionId,
+            payload.createTime,
             {
               allowThumbnail: true,
               skipResolvedCache: true,
@@ -339,6 +352,7 @@ export class ImageDecryptService {
           payload.imageMd5,
           payload.imageDatName,
           payload.sessionId,
+          payload.createTime,
           {
             allowThumbnail: true,
             skipResolvedCache: false,
@@ -368,21 +382,18 @@ export class ImageDecryptService {
         return { success: true, localPath, isThumb }
       }
 
-      // 查找已缓存的解密文件（hardlink-only 模式下跳过全缓存目录扫描）
-      if (!payload.hardlinkOnly) {
-        const existing = this.findCachedOutput(cacheKey, payload.force, payload.sessionId)
-        if (existing) {
-          this.logInfo('找到已解密文件', { existing, isHd: this.isHdPath(existing) })
-          const isHd = this.isHdPath(existing)
-          // 如果要求高清但找到的是缩略图，继续解密高清图
-          if (!(payload.force && !isHd)) {
-            this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existing)
-            const localPath = this.resolveLocalPathForPayload(existing, payload.preferFilePath)
-            const isThumb = this.isThumbnailPath(existing)
-            this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existing, payload.preferFilePath))
-            this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
-            return { success: true, localPath, isThumb }
-          }
+      const preferHdCache = Boolean(payload.force && !fallbackToThumbnail)
+      const existingFast = this.findCachedOutputByDatPath(datPath, payload.sessionId, preferHdCache)
+      if (existingFast) {
+        this.logInfo('找到已解密文件(按DAT快速命中)', { existing: existingFast, isHd: this.isHdPath(existingFast) })
+        const isHd = this.isHdPath(existingFast)
+        if (!(payload.force && !isHd)) {
+          this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existingFast)
+          const localPath = this.resolveLocalPathForPayload(existingFast, payload.preferFilePath)
+          const isThumb = this.isThumbnailPath(existingFast)
+          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existingFast, payload.preferFilePath))
+          this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
+          return { success: true, localPath, isThumb }
         }
       }
 
@@ -407,14 +418,20 @@ export class ImageDecryptService {
       }
 
       const aesKeyRaw = imageKeys.aesKey
-      const aesKey = this.resolveAesKey(aesKeyRaw)
+      const aesKeyText = typeof aesKeyRaw === 'string' ? aesKeyRaw.trim() : ''
+      const aesKeyForNative = aesKeyText || undefined
 
-      this.logInfo('开始解密DAT文件', { datPath, xorKey, hasAesKey: !!aesKey })
+      this.logInfo('开始解密DAT文件(仅Rust原生)', { datPath, xorKey, hasAesKey: Boolean(aesKeyForNative) })
       this.emitDecryptProgress(payload, cacheKey, 'decrypting', 58, 'running')
-      let decrypted = await this.decryptDatAuto(datPath, xorKey, aesKey)
+      const nativeResult = this.tryDecryptDatWithNative(datPath, xorKey, aesKeyForNative)
+      if (!nativeResult) {
+        this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', 'Rust原生解密不可用')
+        return { success: false, error: 'Rust原生解密不可用或解密失败，请检查 native 模块与密钥配置' }
+      }
+      let decrypted: Buffer = nativeResult.data
       this.emitDecryptProgress(payload, cacheKey, 'decrypting', 78, 'running')
 
-      // 检查是否是 wxgf 格式，如果是则尝试提取真实图片数据
+      // 统一走原有 wxgf/ffmpeg 流程，确保行为与历史版本一致
       const wxgfResult = await this.unwrapWxgf(decrypted)
       decrypted = wxgfResult.data
 
@@ -487,6 +504,13 @@ export class ImageDecryptService {
     return null
   }
 
+  private resolveCurrentAccountDir(): string | null {
+    const wxid = this.configService.get('myWxid')
+    const dbPath = this.configService.get('dbPath')
+    if (!wxid || !dbPath) return null
+    return this.resolveAccountDir(dbPath, wxid)
+  }
+
   /**
    * 获取解密后的缓存目录（用于查找 hardlink.db）
    */
@@ -549,6 +573,7 @@ export class ImageDecryptService {
     imageMd5?: string,
     imageDatName?: string,
     sessionId?: string,
+    createTime?: number,
     options?: { allowThumbnail?: boolean; skipResolvedCache?: boolean; hardlinkOnly?: boolean }
   ): Promise<string | null> {
     const allowThumbnail = options?.allowThumbnail ?? true
@@ -557,198 +582,87 @@ export class ImageDecryptService {
     this.logInfo('[ImageDecrypt] resolveDatPath', {
       imageMd5,
       imageDatName,
+      createTime,
       allowThumbnail,
       skipResolvedCache,
       hardlinkOnly
     })
 
-    if (!skipResolvedCache) {
-      if (imageMd5) {
-        const cached = this.resolvedCache.get(imageMd5)
-        if (cached && existsSync(cached)) {
-          const preferred = this.getPreferredDatVariantPath(cached, allowThumbnail)
-          this.cacheDatPath(accountDir, imageMd5, preferred)
-          if (imageDatName) this.cacheDatPath(accountDir, imageDatName, preferred)
-          return preferred
-        }
+    const lookupMd5s = this.collectHardlinkLookupMd5s(imageMd5, imageDatName)
+    if (lookupMd5s.length === 0) {
+      const packedDatFallback = this.resolveDatPathFromParsedDatName(accountDir, imageDatName, sessionId, createTime, allowThumbnail)
+      if (packedDatFallback) {
+        if (imageMd5) this.cacheDatPath(accountDir, imageMd5, packedDatFallback)
+        if (imageDatName) this.cacheDatPath(accountDir, imageDatName, packedDatFallback)
+        const normalizedFileName = basename(packedDatFallback).toLowerCase()
+        if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, packedDatFallback)
+        this.logInfo('[ImageDecrypt] datName fallback hit (no hardlink md5)', {
+          imageMd5,
+          imageDatName,
+          selectedPath: packedDatFallback
+        })
+        return packedDatFallback
       }
-      if (imageDatName) {
-        const cached = this.resolvedCache.get(imageDatName)
-        if (cached && existsSync(cached)) {
-          const preferred = this.getPreferredDatVariantPath(cached, allowThumbnail)
-          this.cacheDatPath(accountDir, imageDatName, preferred)
-          if (imageMd5) this.cacheDatPath(accountDir, imageMd5, preferred)
-          return preferred
-        }
-      }
-    }
-
-    // 1. 通过 MD5 快速定位 (MsgAttach 目录)
-    if (!hardlinkOnly && allowThumbnail && imageMd5) {
-      const res = await this.fastProbabilisticSearch(join(accountDir, 'msg', 'attach'), imageMd5, allowThumbnail)
-      if (res) return res
-      if (imageDatName && imageDatName !== imageMd5 && this.looksLikeMd5(imageDatName)) {
-        const datNameRes = await this.fastProbabilisticSearch(join(accountDir, 'msg', 'attach'), imageDatName, allowThumbnail)
-        if (datNameRes) return datNameRes
-      }
-    }
-
-    // 2. 如果 imageDatName 看起来像 MD5，也尝试快速定位
-    if (!hardlinkOnly && allowThumbnail && !imageMd5 && imageDatName && this.looksLikeMd5(imageDatName)) {
-      const res = await this.fastProbabilisticSearch(join(accountDir, 'msg', 'attach'), imageDatName, allowThumbnail)
-      if (res) return res
-    }
-
-    // 优先通过 hardlink.db 查询
-    if (imageMd5) {
-      this.logInfo('[ImageDecrypt] hardlink lookup (md5)', { imageMd5, sessionId })
-      const hardlinkPath = await this.resolveHardlinkPath(accountDir, imageMd5, sessionId)
-      if (hardlinkPath) {
-        const preferredPath = this.getPreferredDatVariantPath(hardlinkPath, allowThumbnail)
-        const isThumb = this.isThumbnailPath(preferredPath)
-        if (allowThumbnail || !isThumb) {
-          this.logInfo('[ImageDecrypt] hardlink hit', { imageMd5, path: preferredPath })
-          this.cacheDatPath(accountDir, imageMd5, preferredPath)
-          if (imageDatName) this.cacheDatPath(accountDir, imageDatName, preferredPath)
-          return preferredPath
-        }
-        // hardlink 找到的是缩略图，但要求高清图
-        // 尝试在同一目录下查找高清图变体（快速查找，不遍历）
-        const hdPath = this.findHdVariantInSameDir(preferredPath)
-        if (hdPath) {
-          this.cacheDatPath(accountDir, imageMd5, hdPath)
-          if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hdPath)
-          return hdPath
-        }
-        // 没找到高清图，返回 null（不进行全局搜索）
-        return null
-      }
-      this.logInfo('[ImageDecrypt] hardlink miss (md5)', { imageMd5 })
-      if (imageDatName && this.looksLikeMd5(imageDatName) && imageDatName !== imageMd5) {
-        this.logInfo('[ImageDecrypt] hardlink fallback (datName)', { imageDatName, sessionId })
-        const fallbackPath = await this.resolveHardlinkPath(accountDir, imageDatName, sessionId)
-        if (fallbackPath) {
-          const preferredPath = this.getPreferredDatVariantPath(fallbackPath, allowThumbnail)
-          const isThumb = this.isThumbnailPath(preferredPath)
-          if (allowThumbnail || !isThumb) {
-            this.logInfo('[ImageDecrypt] hardlink hit (datName)', { imageMd5: imageDatName, path: preferredPath })
-            this.cacheDatPath(accountDir, imageDatName, preferredPath)
-            this.cacheDatPath(accountDir, imageMd5, preferredPath)
-            return preferredPath
-          }
-          // 找到缩略图但要求高清图，尝试同目录查找高清图变体
-          const hdPath = this.findHdVariantInSameDir(preferredPath)
-          if (hdPath) {
-            this.cacheDatPath(accountDir, imageDatName, hdPath)
-            this.cacheDatPath(accountDir, imageMd5, hdPath)
-            return hdPath
-          }
-          return null
-        }
-        this.logInfo('[ImageDecrypt] hardlink miss (datName)', { imageDatName })
-      }
-    }
-
-    if (!imageMd5 && imageDatName && this.looksLikeMd5(imageDatName)) {
-      this.logInfo('[ImageDecrypt] hardlink lookup (datName)', { imageDatName, sessionId })
-      const hardlinkPath = await this.resolveHardlinkPath(accountDir, imageDatName, sessionId)
-      if (hardlinkPath) {
-        const preferredPath = this.getPreferredDatVariantPath(hardlinkPath, allowThumbnail)
-        const isThumb = this.isThumbnailPath(preferredPath)
-        if (allowThumbnail || !isThumb) {
-          this.logInfo('[ImageDecrypt] hardlink hit', { imageMd5: imageDatName, path: preferredPath })
-          this.cacheDatPath(accountDir, imageDatName, preferredPath)
-          return preferredPath
-        }
-        // hardlink 找到的是缩略图，但要求高清图
-        const hdPath = this.findHdVariantInSameDir(preferredPath)
-        if (hdPath) {
-          this.cacheDatPath(accountDir, imageDatName, hdPath)
-          return hdPath
-        }
-        return null
-      }
-      this.logInfo('[ImageDecrypt] hardlink miss (datName)', { imageDatName })
-    }
-
-    if (hardlinkOnly) {
-      this.logInfo('[ImageDecrypt] resolveDatPath miss (hardlink-only)', { imageMd5, imageDatName })
+      this.logInfo('[ImageDecrypt] resolveDatPath miss (no hardlink md5)', { imageMd5, imageDatName })
       return null
     }
 
-    const searchNames = Array.from(
-      new Set([imageDatName, imageMd5].map((item) => String(item || '').trim()).filter(Boolean))
-    )
-    if (searchNames.length === 0) return null
-
     if (!skipResolvedCache) {
-      for (const searchName of searchNames) {
-        const cached = this.resolvedCache.get(searchName)
-        if (cached && existsSync(cached)) {
-          const preferred = this.getPreferredDatVariantPath(cached, allowThumbnail)
-          if (allowThumbnail || !this.isThumbnailPath(preferred)) return preferred
-          // 缓存的是缩略图，尝试找高清图
-          const hdPath = this.findHdVariantInSameDir(preferred)
-          if (hdPath) return hdPath
-        }
+      const cacheCandidates = Array.from(new Set([
+        ...lookupMd5s,
+        String(imageMd5 || '').trim().toLowerCase(),
+        String(imageDatName || '').trim().toLowerCase()
+      ].filter(Boolean)))
+      for (const cacheKey of cacheCandidates) {
+        const scopedKey = `${accountDir}|${cacheKey}`
+        const cached = this.resolvedCache.get(scopedKey)
+        if (!cached) continue
+        if (!existsSync(cached)) continue
+        if (!allowThumbnail && this.isThumbnailPath(cached)) continue
+        return cached
       }
     }
 
-    for (const searchName of searchNames) {
-      const datPath = await this.searchDatFile(accountDir, searchName, allowThumbnail)
-      if (datPath) {
-        this.logInfo('[ImageDecrypt] searchDatFile hit', { imageDatName, searchName, path: datPath })
-        if (imageDatName) this.resolvedCache.set(imageDatName, datPath)
-        if (imageMd5) this.resolvedCache.set(imageMd5, datPath)
-        this.cacheDatPath(accountDir, searchName, datPath)
-        if (imageDatName && imageDatName !== searchName) this.cacheDatPath(accountDir, imageDatName, datPath)
-        if (imageMd5 && imageMd5 !== searchName) this.cacheDatPath(accountDir, imageMd5, datPath)
-        return datPath
-      }
+    for (const lookupMd5 of lookupMd5s) {
+      this.logInfo('[ImageDecrypt] hardlink lookup', { lookupMd5, sessionId, hardlinkOnly })
+      const hardlinkPath = await this.resolveHardlinkPath(accountDir, lookupMd5, sessionId)
+      if (!hardlinkPath) continue
+      if (!allowThumbnail && this.isThumbnailPath(hardlinkPath)) continue
+
+      this.cacheDatPath(accountDir, lookupMd5, hardlinkPath)
+      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hardlinkPath)
+      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hardlinkPath)
+      const normalizedFileName = basename(hardlinkPath).toLowerCase()
+      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, hardlinkPath)
+      return hardlinkPath
     }
 
-    for (const searchName of searchNames) {
-      const normalized = this.normalizeDatBase(searchName)
-      if (normalized !== searchName.toLowerCase()) {
-        const normalizedPath = await this.searchDatFile(accountDir, normalized, allowThumbnail)
-        if (normalizedPath) {
-          this.logInfo('[ImageDecrypt] searchDatFile hit (normalized)', { imageDatName, searchName, normalized, path: normalizedPath })
-          if (imageDatName) this.resolvedCache.set(imageDatName, normalizedPath)
-          if (imageMd5) this.resolvedCache.set(imageMd5, normalizedPath)
-          this.cacheDatPath(accountDir, searchName, normalizedPath)
-          if (imageDatName && imageDatName !== searchName) this.cacheDatPath(accountDir, imageDatName, normalizedPath)
-          if (imageMd5 && imageMd5 !== searchName) this.cacheDatPath(accountDir, imageMd5, normalizedPath)
-          return normalizedPath
-        }
-      }
+    const packedDatFallback = this.resolveDatPathFromParsedDatName(accountDir, imageDatName, sessionId, createTime, allowThumbnail)
+    if (packedDatFallback) {
+      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, packedDatFallback)
+      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, packedDatFallback)
+      const normalizedFileName = basename(packedDatFallback).toLowerCase()
+      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, packedDatFallback)
+      this.logInfo('[ImageDecrypt] datName fallback hit (hardlink miss)', {
+        imageMd5,
+        imageDatName,
+        lookupMd5s,
+        selectedPath: packedDatFallback
+      })
+      return packedDatFallback
     }
-    this.logInfo('[ImageDecrypt] resolveDatPath miss', { imageDatName, imageMd5, searchNames })
+
+    this.logInfo('[ImageDecrypt] resolveDatPath miss (hardlink + datName fallback)', {
+      imageMd5,
+      imageDatName,
+      lookupMd5s
+    })
     return null
   }
 
-  private async resolveThumbnailDatPath(
-    accountDir: string,
-    imageMd5?: string,
-    imageDatName?: string,
-    sessionId?: string
-  ): Promise<string | null> {
-    if (imageMd5) {
-      const hardlinkPath = await this.resolveHardlinkPath(accountDir, imageMd5, sessionId)
-      if (hardlinkPath && this.isThumbnailPath(hardlinkPath)) return hardlinkPath
-    }
-
-    if (!imageMd5 && imageDatName && this.looksLikeMd5(imageDatName)) {
-      const hardlinkPath = await this.resolveHardlinkPath(accountDir, imageDatName, sessionId)
-      if (hardlinkPath && this.isThumbnailPath(hardlinkPath)) return hardlinkPath
-    }
-
-    if (!imageDatName) return null
-    return this.searchDatFile(accountDir, imageDatName, true, true)
-  }
-
   private async checkHasUpdate(
-    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string },
-    cacheKey: string,
+    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number },
+    _cacheKey: string,
     cachedPath: string
   ): Promise<boolean> {
     if (!cachedPath || !existsSync(cachedPath)) return false
@@ -760,37 +674,94 @@ export class ImageDecryptService {
     const accountDir = this.resolveAccountDir(dbPath, wxid)
     if (!accountDir) return false
 
-    const quickDir = this.getCachedDatDir(accountDir, payload.imageDatName, payload.imageMd5)
-    if (quickDir) {
-      const baseName = payload.imageDatName || payload.imageMd5 || cacheKey
-      const candidate = this.findNonThumbnailVariantInDir(quickDir, baseName)
-      if (candidate) {
-        return true
-      }
-    }
-
-    const thumbPath = await this.resolveThumbnailDatPath(
+    const hdPath = await this.resolveDatPath(
       accountDir,
       payload.imageMd5,
       payload.imageDatName,
-      payload.sessionId
+      payload.sessionId,
+      payload.createTime,
+      { allowThumbnail: false, skipResolvedCache: true, hardlinkOnly: true }
     )
-    if (thumbPath) {
-      const baseName = payload.imageDatName || payload.imageMd5 || cacheKey
-      const candidate = this.findNonThumbnailVariantInDir(dirname(thumbPath), baseName)
-      if (candidate) {
-        return true
-      }
-      const searchHit = await this.searchDatFileInDir(dirname(thumbPath), baseName, false)
-      if (searchHit && this.isNonThumbnailVariantDat(searchHit)) {
-        return true
-      }
+    return Boolean(hdPath)
+  }
+
+  private async tryPromoteThumbnailCache(
+    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; preferFilePath?: boolean },
+    cacheKey: string,
+    cachedPath: string
+  ): Promise<string | null> {
+    if (!cachedPath || !existsSync(cachedPath)) return null
+    if (!this.isImageFile(cachedPath)) return null
+    if (!this.isThumbnailPath(cachedPath)) return null
+
+    const accountDir = this.resolveCurrentAccountDir()
+    if (!accountDir) return null
+
+    const hdDatPath = await this.resolveDatPath(
+      accountDir,
+      payload.imageMd5,
+      payload.imageDatName,
+      payload.sessionId,
+      payload.createTime,
+      { allowThumbnail: false, skipResolvedCache: true, hardlinkOnly: true }
+    )
+    if (!hdDatPath) return null
+
+    const existingHd = this.findCachedOutputByDatPath(hdDatPath, payload.sessionId, true)
+    if (existingHd && existsSync(existingHd) && this.isImageFile(existingHd) && !this.isThumbnailPath(existingHd)) {
+      this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existingHd)
+      this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
+      this.removeThumbnailCacheFile(cachedPath, existingHd)
+      this.logInfo('[ImageDecrypt] thumbnail cache upgraded', {
+        cacheKey,
+        oldPath: cachedPath,
+        newPath: existingHd,
+        mode: 'existing'
+      })
+      return existingHd
     }
-    return false
+
+    const upgraded = await this.decryptImage({
+      sessionId: payload.sessionId,
+      imageMd5: payload.imageMd5,
+      imageDatName: payload.imageDatName,
+      createTime: payload.createTime,
+      preferFilePath: true,
+      force: true,
+      hardlinkOnly: true,
+      disableUpdateCheck: true
+    })
+    if (!upgraded.success) return null
+
+    const cachedResult = this.resolvedCache.get(cacheKey)
+    const upgradedPath = (cachedResult && existsSync(cachedResult))
+      ? cachedResult
+      : String(upgraded.localPath || '').trim()
+    if (!upgradedPath || !existsSync(upgradedPath)) return null
+    if (!this.isImageFile(upgradedPath) || this.isThumbnailPath(upgradedPath)) return null
+
+    this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, upgradedPath)
+    this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
+    this.removeThumbnailCacheFile(cachedPath, upgradedPath)
+    this.logInfo('[ImageDecrypt] thumbnail cache upgraded', {
+      cacheKey,
+      oldPath: cachedPath,
+      newPath: upgradedPath,
+      mode: 're-decrypt'
+    })
+    return upgradedPath
+  }
+
+  private removeThumbnailCacheFile(oldPath: string, keepPath?: string): void {
+    if (!oldPath) return
+    if (keepPath && oldPath === keepPath) return
+    if (!existsSync(oldPath)) return
+    if (!this.isThumbnailPath(oldPath)) return
+    void rm(oldPath, { force: true }).catch(() => { })
   }
 
   private triggerUpdateCheck(
-    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string },
+    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number },
     cacheKey: string,
     cachedPath: string
   ): void {
@@ -804,50 +775,429 @@ export class ImageDecryptService {
 
 
 
-  private resolveHardlinkDbPath(accountDir: string): string | null {
-    const wxid = this.configService.get('myWxid')
-    const cacheDir = wxid ? this.getDecryptedCacheDir(wxid) : null
-    const candidates = [
-      join(accountDir, 'db_storage', 'hardlink', 'hardlink.db'),
-      join(accountDir, 'hardlink.db'),
-      cacheDir ? join(cacheDir, 'hardlink.db') : null
-    ].filter(Boolean) as string[]
-    this.logInfo('[ImageDecrypt] hardlink db probe', { accountDir, cacheDir, candidates })
-    for (const candidate of candidates) {
-      if (existsSync(candidate)) return candidate
+  private collectHardlinkLookupMd5s(imageMd5?: string, imageDatName?: string): string[] {
+    const keys: string[] = []
+    const pushMd5 = (value?: string) => {
+      const normalized = String(value || '').trim().toLowerCase()
+      if (!normalized) return
+      if (!this.looksLikeMd5(normalized)) return
+      if (!keys.includes(normalized)) keys.push(normalized)
     }
-    this.logInfo('[ImageDecrypt] hardlink db missing', { accountDir, cacheDir, candidates })
+
+    pushMd5(imageMd5)
+
+    const datNameRaw = String(imageDatName || '').trim().toLowerCase()
+    if (!datNameRaw) return keys
+    pushMd5(datNameRaw)
+    const datNameNoExt = datNameRaw.endsWith('.dat') ? datNameRaw.slice(0, -4) : datNameRaw
+    pushMd5(datNameNoExt)
+    pushMd5(this.normalizeDatBase(datNameNoExt))
+    return keys
+  }
+
+  private resolveDatPathFromParsedDatName(
+    accountDir: string,
+    imageDatName?: string,
+    sessionId?: string,
+    createTime?: number,
+    allowThumbnail = true
+  ): string | null {
+    const datNameRaw = String(imageDatName || '').trim().toLowerCase()
+    if (!datNameRaw) return null
+    const datNameNoExt = datNameRaw.endsWith('.dat') ? datNameRaw.slice(0, -4) : datNameRaw
+    const baseMd5 = this.normalizeDatBase(datNameNoExt)
+    if (!this.looksLikeMd5(baseMd5)) return null
+
+    const monthKey = this.resolveYearMonthFromCreateTime(createTime)
+    const missKey = `${accountDir}|scan|${String(sessionId || '').trim()}|${monthKey}|${baseMd5}|${allowThumbnail ? 'all' : 'hd'}`
+    const lastMiss = this.datNameScanMissAt.get(missKey) || 0
+    if (lastMiss && (Date.now() - lastMiss) < this.datNameScanMissTtlMs) {
+      return null
+    }
+
+    const sessionMonthCandidates = this.collectDatCandidatesFromSessionMonth(accountDir, baseMd5, sessionId, createTime)
+    if (sessionMonthCandidates.length > 0) {
+      const orderedSessionMonth = this.sortDatCandidatePaths(sessionMonthCandidates, baseMd5)
+      for (const candidatePath of orderedSessionMonth) {
+        if (!allowThumbnail && this.isThumbnailPath(candidatePath)) continue
+        this.datNameScanMissAt.delete(missKey)
+        this.logInfo('[ImageDecrypt] datName fallback selected (session-month)', {
+          accountDir,
+          sessionId,
+          imageDatName: datNameRaw,
+          createTime,
+          monthKey,
+          baseMd5,
+          allowThumbnail,
+          selectedPath: candidatePath
+        })
+        return candidatePath
+      }
+    }
+
+    const hasPreciseContext = Boolean(String(sessionId || '').trim() && monthKey)
+    if (hasPreciseContext) {
+      this.datNameScanMissAt.set(missKey, Date.now())
+      this.logInfo('[ImageDecrypt] datName fallback precise scan miss', {
+        accountDir,
+        sessionId,
+        imageDatName: datNameRaw,
+        createTime,
+        monthKey,
+        baseMd5,
+        allowThumbnail
+      })
+      return null
+    }
+
+    const candidates = this.collectDatCandidatesFromAccountDir(accountDir, baseMd5)
+    if (candidates.length === 0) {
+      this.datNameScanMissAt.set(missKey, Date.now())
+      this.logInfo('[ImageDecrypt] datName fallback scan miss', {
+        accountDir,
+        sessionId,
+        imageDatName: datNameRaw,
+        createTime,
+        monthKey,
+        baseMd5,
+        allowThumbnail
+      })
+      return null
+    }
+
+    const ordered = this.sortDatCandidatePaths(candidates, baseMd5)
+    for (const candidatePath of ordered) {
+      if (!allowThumbnail && this.isThumbnailPath(candidatePath)) continue
+      this.datNameScanMissAt.delete(missKey)
+      this.logInfo('[ImageDecrypt] datName fallback selected', {
+        accountDir,
+        sessionId,
+        imageDatName: datNameRaw,
+        createTime,
+        monthKey,
+        baseMd5,
+        allowThumbnail,
+        selectedPath: candidatePath
+      })
+      return candidatePath
+    }
+
+    this.datNameScanMissAt.set(missKey, Date.now())
     return null
+  }
+
+  private resolveYearMonthFromCreateTime(createTime?: number): string {
+    const raw = Number(createTime)
+    if (!Number.isFinite(raw) || raw <= 0) return ''
+    const ts = raw > 1e12 ? raw : raw * 1000
+    const d = new Date(ts)
+    if (Number.isNaN(d.getTime())) return ''
+    const y = d.getFullYear()
+    const m = String(d.getMonth() + 1).padStart(2, '0')
+    return `${y}-${m}`
+  }
+
+  private collectDatCandidatesFromSessionMonth(
+    accountDir: string,
+    baseMd5: string,
+    sessionId?: string,
+    createTime?: number
+  ): string[] {
+    const normalizedSessionId = String(sessionId || '').trim()
+    const monthKey = this.resolveYearMonthFromCreateTime(createTime)
+    if (!normalizedSessionId || !monthKey) return []
+
+    const attachRoots = this.getAttachScanRoots(accountDir)
+    const cacheRoots = this.getMessageCacheScanRoots(accountDir)
+    const sessionDirs = this.getAttachSessionDirCandidates(normalizedSessionId)
+    const candidates = new Set<string>()
+    const budget = { remaining: 600 }
+    const targetDirs: Array<{ dir: string; depth: number }> = []
+
+    for (const root of attachRoots) {
+      for (const sessionDir of sessionDirs) {
+        targetDirs.push({ dir: join(root, sessionDir, monthKey), depth: 2 })
+        targetDirs.push({ dir: join(root, sessionDir, monthKey, 'Img'), depth: 1 })
+        targetDirs.push({ dir: join(root, sessionDir, monthKey, 'Image'), depth: 1 })
+      }
+    }
+
+    for (const root of cacheRoots) {
+      for (const sessionDir of sessionDirs) {
+        targetDirs.push({ dir: join(root, monthKey, 'Message', sessionDir, 'Bubble'), depth: 1 })
+        targetDirs.push({ dir: join(root, monthKey, 'Message', sessionDir), depth: 2 })
+      }
+    }
+
+    for (const target of targetDirs) {
+      if (budget.remaining <= 0) break
+      this.scanDatCandidatesUnderRoot(target.dir, baseMd5, target.depth, candidates, budget)
+    }
+
+    return Array.from(candidates)
+  }
+
+  private getAttachScanRoots(accountDir: string): string[] {
+    const roots: string[] = []
+    const push = (value: string) => {
+      const normalized = String(value || '').trim()
+      if (!normalized) return
+      if (!roots.includes(normalized)) roots.push(normalized)
+    }
+
+    push(join(accountDir, 'msg', 'attach'))
+    push(join(accountDir, 'attach'))
+    const parent = dirname(accountDir)
+    if (parent && parent !== accountDir) {
+      push(join(parent, 'msg', 'attach'))
+      push(join(parent, 'attach'))
+    }
+    return roots
+  }
+
+  private getMessageCacheScanRoots(accountDir: string): string[] {
+    const roots: string[] = []
+    const push = (value: string) => {
+      const normalized = String(value || '').trim()
+      if (!normalized) return
+      if (!roots.includes(normalized)) roots.push(normalized)
+    }
+
+    push(join(accountDir, 'cache'))
+    const parent = dirname(accountDir)
+    if (parent && parent !== accountDir) {
+      push(join(parent, 'cache'))
+    }
+    return roots
+  }
+
+  private getAttachSessionDirCandidates(sessionId: string): string[] {
+    const normalized = String(sessionId || '').trim()
+    if (!normalized) return []
+    const lower = normalized.toLowerCase()
+    const cleaned = this.cleanAccountDirName(normalized)
+    const inputs = Array.from(new Set([normalized, lower, cleaned, cleaned.toLowerCase()].filter(Boolean)))
+    const results: string[] = []
+    const push = (value: string) => {
+      if (!value) return
+      if (!results.includes(value)) results.push(value)
+    }
+
+    for (const item of inputs) {
+      push(item)
+      const md5 = crypto.createHash('md5').update(item).digest('hex').toLowerCase()
+      push(md5)
+      push(md5.slice(0, 16))
+    }
+    return results
+  }
+
+  private collectDatCandidatesFromAccountDir(accountDir: string, baseMd5: string): string[] {
+    const roots = this.getDatScanRoots(accountDir)
+    const candidates = new Set<string>()
+    const budget = { remaining: 1400 }
+
+    for (const item of roots) {
+      if (budget.remaining <= 0) break
+      this.scanDatCandidatesUnderRoot(item.root, baseMd5, item.maxDepth, candidates, budget)
+    }
+
+    if (candidates.size === 0 && budget.remaining <= 0) {
+      this.logInfo('[ImageDecrypt] datName fallback budget exhausted', {
+        accountDir,
+        baseMd5,
+        roots: roots.map((item) => item.root)
+      })
+    }
+
+    return Array.from(candidates)
+  }
+
+  private getDatScanRoots(accountDir: string): Array<{ root: string; maxDepth: number }> {
+    const roots: Array<{ root: string; maxDepth: number }> = []
+    const push = (root: string, maxDepth: number) => {
+      const normalized = String(root || '').trim()
+      if (!normalized) return
+      if (roots.some((item) => item.root === normalized)) return
+      roots.push({ root: normalized, maxDepth })
+    }
+
+    push(join(accountDir, 'attach'), 4)
+    push(join(accountDir, 'msg', 'attach'), 4)
+    push(join(accountDir, 'FileStorage', 'Image'), 3)
+    push(join(accountDir, 'FileStorage', 'Image2'), 3)
+    push(join(accountDir, 'FileStorage', 'MsgImg'), 3)
+
+    return roots
+  }
+
+  private scanDatCandidatesUnderRoot(
+    rootDir: string,
+    baseMd5: string,
+    maxDepth: number,
+    out: Set<string>,
+    budget: { remaining: number }
+  ): void {
+    if (!rootDir || maxDepth < 0 || budget.remaining <= 0) return
+    if (!existsSync(rootDir) || !this.isDirectory(rootDir)) return
+
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }]
+    while (stack.length > 0 && budget.remaining > 0) {
+      const current = stack.pop()
+      if (!current) break
+      budget.remaining -= 1
+
+      let entries: Array<{ name: string; isFile: () => boolean; isDirectory: () => boolean }>
+      try {
+        entries = readdirSync(current.dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+
+      for (const entry of entries) {
+        if (!entry.isFile()) continue
+        const name = String(entry.name || '')
+        if (!this.isHardlinkCandidateName(name, baseMd5)) continue
+        const fullPath = join(current.dir, name)
+        if (existsSync(fullPath)) out.add(fullPath)
+      }
+
+      if (current.depth >= maxDepth) continue
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const name = String(entry.name || '')
+        if (!name || name === '.' || name === '..') continue
+        if (name.startsWith('.')) continue
+        stack.push({ dir: join(current.dir, name), depth: current.depth + 1 })
+      }
+    }
+  }
+
+  private sortDatCandidatePaths(paths: string[], baseMd5: string): string[] {
+    const list = Array.from(new Set(paths.filter(Boolean)))
+    list.sort((a, b) => {
+      const nameA = basename(a).toLowerCase()
+      const nameB = basename(b).toLowerCase()
+      const priorityA = this.getHardlinkCandidatePriority(nameA, baseMd5)
+      const priorityB = this.getHardlinkCandidatePriority(nameB, baseMd5)
+      if (priorityA !== priorityB) return priorityA - priorityB
+
+      let mtimeA = 0
+      let mtimeB = 0
+      try {
+        mtimeA = statSync(a).mtimeMs
+      } catch { }
+      try {
+        mtimeB = statSync(b).mtimeMs
+      } catch { }
+      if (mtimeA !== mtimeB) return mtimeB - mtimeA
+      return nameA.localeCompare(nameB)
+    })
+    return list
+  }
+
+  private isPlainMd5DatName(fileName: string): boolean {
+    const lower = String(fileName || '').trim().toLowerCase()
+    if (!lower.endsWith('.dat')) return false
+    const base = lower.slice(0, -4)
+    return this.looksLikeMd5(base)
+  }
+
+  private isHardlinkCandidateName(fileName: string, baseMd5: string): boolean {
+    const lower = String(fileName || '').trim().toLowerCase()
+    if (!lower.endsWith('.dat')) return false
+    const base = lower.slice(0, -4)
+    if (base === baseMd5) return true
+    if (base.startsWith(`${baseMd5}_`) || base.startsWith(`${baseMd5}.`)) return true
+    if (base.length === baseMd5.length + 1 && base.startsWith(baseMd5)) return true
+    return this.normalizeDatBase(base) === baseMd5
+  }
+
+  private getHardlinkCandidatePriority(fileName: string, baseMd5: string): number {
+    const lower = String(fileName || '').trim().toLowerCase()
+    if (!lower.endsWith('.dat')) return 999
+    const base = lower.slice(0, -4)
+
+    // 无后缀 DAT 最后兜底；优先尝试变体 DAT。
+    if (base === baseMd5) return 20
+    // _t / .t / _thumb 等缩略图 DAT 仅作次级回退。
+    if (this.isThumbnailDat(lower)) return 10
+    // 其他非缩略图变体优先。
+    return 0
+  }
+
+  private resolveHardlinkDatVariants(fullPath: string, baseMd5: string): string[] {
+    const dirPath = dirname(fullPath)
+    try {
+      const entries = readdirSync(dirPath, { withFileTypes: true })
+      const candidates = entries
+        .filter((entry) => entry.isFile())
+        .map((entry) => entry.name)
+        .filter((name) => this.isHardlinkCandidateName(name, baseMd5))
+        .map((name) => join(dirPath, name))
+        .filter((candidatePath) => existsSync(candidatePath))
+      return this.sortDatCandidatePaths(candidates, baseMd5)
+    } catch {
+      return []
+    }
+  }
+
+  private normalizeHardlinkDatPathByFileName(fullPath: string, fileName: string): string {
+    const normalizedPath = String(fullPath || '').trim()
+    const normalizedFileName = String(fileName || '').trim().toLowerCase()
+    if (!normalizedPath || !normalizedFileName.endsWith('.dat')) {
+      return normalizedPath
+    }
+
+    // hardlink 记录到具体后缀时（如 _b/.b/_t），直接按记录路径解密。
+    if (!this.isPlainMd5DatName(normalizedFileName)) {
+      return normalizedPath
+    }
+
+    const base = normalizedFileName.slice(0, -4)
+    if (!this.looksLikeMd5(base)) {
+      return normalizedPath
+    }
+
+    const candidates = this.resolveHardlinkDatVariants(normalizedPath, base)
+    if (candidates.length > 0) {
+      return candidates[0]
+    }
+
+    return normalizedPath
   }
 
   private async resolveHardlinkPath(accountDir: string, md5: string, _sessionId?: string): Promise<string | null> {
     try {
+      const normalizedMd5 = String(md5 || '').trim().toLowerCase()
+      if (!this.looksLikeMd5(normalizedMd5)) return null
       const ready = await this.ensureWcdbReady()
       if (!ready) {
         this.logInfo('[ImageDecrypt] hardlink db not ready')
         return null
       }
 
-      const resolveResult = await wcdbService.resolveImageHardlink(md5, accountDir)
+      const resolveResult = await wcdbService.resolveImageHardlink(normalizedMd5, accountDir)
       if (!resolveResult.success || !resolveResult.data) return null
       const fileName = String(resolveResult.data.file_name || '').trim()
       const fullPath = String(resolveResult.data.full_path || '').trim()
-      if (!fileName) return null
+      if (!fileName || !fullPath) return null
 
       const lowerFileName = String(fileName).toLowerCase()
       if (lowerFileName.endsWith('.dat')) {
-        const baseLower = lowerFileName.slice(0, -4)
-        if (!this.isLikelyImageDatBase(baseLower) && !this.looksLikeMd5(baseLower)) {
+        const normalizedBase = this.normalizeDatBase(lowerFileName.slice(0, -4))
+        if (!this.looksLikeMd5(normalizedBase)) {
           this.logInfo('[ImageDecrypt] hardlink fileName rejected', { fileName })
           return null
         }
       }
 
-      if (fullPath && existsSync(fullPath)) {
-        this.logInfo('[ImageDecrypt] hardlink path hit', { fullPath })
-        return fullPath
+      const selectedPath = this.normalizeHardlinkDatPathByFileName(fullPath, fileName)
+      if (existsSync(selectedPath)) {
+        this.logInfo('[ImageDecrypt] hardlink path hit', { md5: normalizedMd5, fileName, fullPath, selectedPath })
+        return selectedPath
       }
-      this.logInfo('[ImageDecrypt] hardlink path miss', { fullPath, md5 })
+      this.logInfo('[ImageDecrypt] hardlink path miss', { md5: normalizedMd5, fileName, fullPath, selectedPath })
       return null
     } catch {
       // ignore
@@ -879,182 +1229,6 @@ export class ImageDecryptService {
     return value.replace(/'/g, "''")
   }
 
-  private async searchDatFile(
-    accountDir: string,
-    datName: string,
-    allowThumbnail = true,
-    thumbOnly = false
-  ): Promise<string | null> {
-    const key = `${accountDir}|${datName}`
-    const cached = this.resolvedCache.get(key)
-    if (cached && existsSync(cached)) {
-      const preferred = this.getPreferredDatVariantPath(cached, allowThumbnail)
-      if (allowThumbnail || !this.isThumbnailPath(preferred)) return preferred
-    }
-
-    const root = join(accountDir, 'msg', 'attach')
-    if (!existsSync(root)) return null
-
-    // 优化1：快速概率性查找
-    // 包含：1. 基于文件名的前缀猜测 (旧版)
-    //       2. 基于日期的最近月份扫描 (新版无索引时)
-    const fastHit = await this.fastProbabilisticSearch(root, datName, allowThumbnail)
-    if (fastHit) {
-      this.resolvedCache.set(key, fastHit)
-      return fastHit
-    }
-
-    // 优化2：兜底扫描 (异步非阻塞)
-    const found = await this.walkForDatInWorker(root, datName.toLowerCase(), 8, allowThumbnail, thumbOnly)
-    if (found) {
-      this.resolvedCache.set(key, found)
-      return found
-    }
-    return null
-  }
-
-  /**
-   * 基于文件名的哈希特征猜测可能的路径
-   * 包含：1. 微信旧版结构 filename.substr(0, 2)/...
-   *       2. 微信新版结构 msg/attach/{hash}/{YYYY-MM}/Img/filename
-   */
-  private async fastProbabilisticSearch(root: string, datName: string, allowThumbnail = true): Promise<string | null> {
-    const { promises: fs } = require('fs')
-    const { join } = require('path')
-
-    try {
-      // --- 策略 A: 旧版路径猜测 (msg/attach/xx/yy/...) ---
-      const lowerName = datName.toLowerCase()
-      const baseName = this.normalizeDatBase(lowerName)
-      const targetNames = this.buildPreferredDatNames(baseName, allowThumbnail)
-
-      const candidates: string[] = []
-      if (/^[a-f0-9]{32}$/.test(baseName)) {
-        const dir1 = baseName.substring(0, 2)
-        const dir2 = baseName.substring(2, 4)
-        for (const targetName of targetNames) {
-          candidates.push(
-            join(root, dir1, dir2, targetName),
-            join(root, dir1, dir2, 'Img', targetName),
-            join(root, dir1, dir2, 'mg', targetName),
-            join(root, dir1, dir2, 'Image', targetName)
-          )
-        }
-      }
-
-      for (const path of candidates) {
-        try {
-          await fs.access(path)
-          return path
-        } catch { }
-      }
-
-      // --- 策略 B: 新版 Session 哈希路径猜测 ---
-      try {
-        const entries = await fs.readdir(root, { withFileTypes: true })
-        const sessionDirs = entries
-          .filter((e: any) => e.isDirectory() && e.name.length === 32 && /^[a-f0-9]+$/i.test(e.name))
-          .map((e: any) => e.name)
-
-        if (sessionDirs.length === 0) return null
-
-        const now = new Date()
-        const months: string[] = []
-        // Imported mobile history can live in older YYYY-MM buckets; keep this bounded but wider than "recent 2 months".
-        for (let i = 0; i < 24; i++) {
-          const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
-          const mStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-          months.push(mStr)
-        }
-
-        const batchSize = 20
-        for (let i = 0; i < sessionDirs.length; i += batchSize) {
-          const batch = sessionDirs.slice(i, i + batchSize)
-          const tasks = batch.map(async (sessDir: string) => {
-            for (const month of months) {
-              const subDirs = ['Img', 'Image']
-              for (const sub of subDirs) {
-                const dirPath = join(root, sessDir, month, sub)
-                try { await fs.access(dirPath) } catch { continue }
-                for (const name of targetNames) {
-                  const p = join(dirPath, name)
-                  try { await fs.access(p); return p } catch { }
-                }
-              }
-            }
-            return null
-          })
-          const results = await Promise.all(tasks)
-          const hit = results.find(r => r !== null)
-          if (hit) return hit
-        }
-      } catch { }
-
-    } catch { }
-    return null
-  }
-
-  /**
-   * 在同一目录下查找高清图变体
-   * 优先 `_h`，再回退其他非缩略图变体
-   */
-  private findHdVariantInSameDir(thumbPath: string): string | null {
-    try {
-      const dir = dirname(thumbPath)
-      const fileName = basename(thumbPath)
-      return this.findPreferredDatVariantInDir(dir, fileName, false)
-    } catch { }
-    return null
-  }
-
-  private async searchDatFileInDir(
-    dirPath: string,
-    datName: string,
-    allowThumbnail = true
-  ): Promise<string | null> {
-    if (!existsSync(dirPath)) return null
-    return await this.walkForDatInWorker(dirPath, datName.toLowerCase(), 3, allowThumbnail, false)
-  }
-
-  private async walkForDatInWorker(
-    root: string,
-    datName: string,
-    maxDepth = 4,
-    allowThumbnail = true,
-    thumbOnly = false
-  ): Promise<string | null> {
-    const workerPath = join(__dirname, 'imageSearchWorker.js')
-    return await new Promise((resolve) => {
-      const worker = new Worker(workerPath, {
-        workerData: { root, datName, maxDepth, allowThumbnail, thumbOnly }
-      })
-
-      const cleanup = () => {
-        worker.removeAllListeners()
-      }
-
-      worker.on('message', (msg: any) => {
-        if (msg && msg.type === 'done') {
-          cleanup()
-          void worker.terminate()
-          resolve(msg.path || null)
-          return
-        }
-        if (msg && msg.type === 'error') {
-          cleanup()
-          void worker.terminate()
-          resolve(null)
-        }
-      })
-
-      worker.on('error', () => {
-        cleanup()
-        void worker.terminate()
-        resolve(null)
-      })
-      })
-  }
-
   private stripDatVariantSuffix(base: string): string {
     const lower = base.toLowerCase()
     const suffixes = ['_thumb', '.thumb', '_hd', '.hd', '_h', '.h', '_b', '.b', '_w', '.w', '_t', '.t', '_c', '.c']
@@ -1069,77 +1243,6 @@ export class ImageDecryptService {
     return lower
   }
 
-  private getDatVariantPriority(name: string): number {
-    const lower = name.toLowerCase()
-    const baseLower = lower.endsWith('.dat') || lower.endsWith('.jpg') ? lower.slice(0, -4) : lower
-    if (baseLower.endsWith('_h') || baseLower.endsWith('.h')) return 600
-    if (baseLower.endsWith('_hd') || baseLower.endsWith('.hd')) return 550
-    if (baseLower.endsWith('_b') || baseLower.endsWith('.b')) return 520
-    if (baseLower.endsWith('_w') || baseLower.endsWith('.w')) return 510
-    if (!this.hasXVariant(baseLower)) return 500
-    if (baseLower.endsWith('_c') || baseLower.endsWith('.c')) return 400
-    if (this.isThumbnailDat(lower)) return 100
-    return 350
-  }
-
-  private buildPreferredDatNames(baseName: string, allowThumbnail: boolean): string[] {
-    if (!baseName) return []
-    const names = [
-      `${baseName}_h.dat`,
-      `${baseName}.h.dat`,
-      `${baseName}_hd.dat`,
-      `${baseName}.hd.dat`,
-      `${baseName}_b.dat`,
-      `${baseName}.b.dat`,
-      `${baseName}_w.dat`,
-      `${baseName}.w.dat`,
-      `${baseName}.dat`,
-      `${baseName}_c.dat`,
-      `${baseName}.c.dat`
-    ]
-    if (allowThumbnail) {
-      names.push(
-        `${baseName}_thumb.dat`,
-        `${baseName}.thumb.dat`,
-        `${baseName}_t.dat`,
-        `${baseName}.t.dat`
-      )
-    }
-    return Array.from(new Set(names))
-  }
-
-  private findPreferredDatVariantInDir(dirPath: string, baseName: string, allowThumbnail: boolean): string | null {
-    let entries: string[]
-    try {
-      entries = readdirSync(dirPath)
-    } catch {
-      return null
-    }
-    const target = this.normalizeDatBase(baseName.toLowerCase())
-    let bestPath: string | null = null
-    let bestScore = Number.NEGATIVE_INFINITY
-    for (const entry of entries) {
-      const lower = entry.toLowerCase()
-      if (!lower.endsWith('.dat')) continue
-      if (!allowThumbnail && this.isThumbnailDat(lower)) continue
-      const baseLower = lower.slice(0, -4)
-      if (this.normalizeDatBase(baseLower) !== target) continue
-      const score = this.getDatVariantPriority(lower)
-      if (score > bestScore) {
-        bestScore = score
-        bestPath = join(dirPath, entry)
-      }
-    }
-    return bestPath
-  }
-
-  private getPreferredDatVariantPath(datPath: string, allowThumbnail: boolean): string {
-    const lower = datPath.toLowerCase()
-    if (!lower.endsWith('.dat')) return datPath
-    const preferred = this.findPreferredDatVariantInDir(dirname(datPath), basename(datPath), allowThumbnail)
-    return preferred || datPath
-  }
-
   private normalizeDatBase(name: string): string {
     let base = name.toLowerCase()
     if (base.endsWith('.dat') || base.endsWith('.jpg')) {
@@ -1152,122 +1255,6 @@ export class ImageDecryptService {
       }
       base = stripped
     }
-  }
-
-  private hasImageVariantSuffix(baseLower: string): boolean {
-    return this.stripDatVariantSuffix(baseLower) !== baseLower
-  }
-
-  private isLikelyImageDatBase(baseLower: string): boolean {
-    return this.hasImageVariantSuffix(baseLower) || this.looksLikeMd5(this.normalizeDatBase(baseLower))
-  }
-
-
-
-  private findCachedOutput(cacheKey: string, preferHd: boolean = false, sessionId?: string): string | null {
-    const allRoots = this.getAllCacheRoots()
-    const normalizedKey = this.normalizeDatBase(cacheKey.toLowerCase())
-    const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-
-    // 遍历所有可能的缓存根路径
-    for (const root of allRoots) {
-      // 策略1: 新目录结构 Images/{sessionId}/{YYYY-MM}/{file}_hd.jpg
-      if (sessionId) {
-        const sessionDir = join(root, this.sanitizeDirName(sessionId))
-        if (existsSync(sessionDir)) {
-          try {
-            const dateDirs = readdirSync(sessionDir, { withFileTypes: true })
-              .filter(d => d.isDirectory() && /^\d{4}-\d{2}$/.test(d.name))
-              .map(d => d.name)
-              .sort()
-              .reverse() // 最新的日期优先
-
-            for (const dateDir of dateDirs) {
-              const imageDir = join(sessionDir, dateDir)
-              const hit = this.findCachedOutputInDir(imageDir, normalizedKey, extensions, preferHd)
-              if (hit) return hit
-            }
-          } catch { }
-        }
-      }
-
-      // 策略2: 遍历所有 sessionId 目录查找（如果没有指定 sessionId）
-      try {
-        const sessionDirs = readdirSync(root, { withFileTypes: true })
-          .filter(d => d.isDirectory())
-          .map(d => d.name)
-
-        for (const session of sessionDirs) {
-          const sessionDir = join(root, session)
-          // 检查是否是日期目录结构
-          try {
-            const subDirs = readdirSync(sessionDir, { withFileTypes: true })
-              .filter(d => d.isDirectory() && /^\d{4}-\d{2}$/.test(d.name))
-              .map(d => d.name)
-
-            for (const dateDir of subDirs) {
-              const imageDir = join(sessionDir, dateDir)
-              const hit = this.findCachedOutputInDir(imageDir, normalizedKey, extensions, preferHd)
-              if (hit) return hit
-            }
-          } catch { }
-        }
-      } catch { }
-
-      // 策略3: 旧目录结构 Images/{normalizedKey}/{normalizedKey}_thumb.jpg
-      const oldImageDir = join(root, normalizedKey)
-      if (existsSync(oldImageDir)) {
-        const hit = this.findCachedOutputInDir(oldImageDir, normalizedKey, extensions, preferHd)
-        if (hit) return hit
-      }
-
-      // 策略4: 最旧的平铺结构 Images/{file}.jpg
-      for (const ext of extensions) {
-        const candidate = join(root, `${cacheKey}${ext}`)
-        if (existsSync(candidate)) return candidate
-      }
-      for (const ext of extensions) {
-        const candidate = join(root, `${cacheKey}_t${ext}`)
-        if (existsSync(candidate)) return candidate
-      }
-    }
-
-    return null
-  }
-
-  private findCachedOutputInDir(
-    dirPath: string,
-    normalizedKey: string,
-    extensions: string[],
-    preferHd: boolean
-  ): string | null {
-    // 先检查并删除旧的 .hevc 文件（ffmpeg 转换失败时遗留的）
-    const hevcThumb = join(dirPath, `${normalizedKey}_thumb.hevc`)
-    const hevcHd = join(dirPath, `${normalizedKey}_hd.hevc`)
-    try {
-      if (existsSync(hevcThumb)) {
-        require('fs').unlinkSync(hevcThumb)
-      }
-      if (existsSync(hevcHd)) {
-        require('fs').unlinkSync(hevcHd)
-      }
-    } catch { }
-
-    for (const ext of extensions) {
-      if (preferHd) {
-        const hdPath = join(dirPath, `${normalizedKey}_hd${ext}`)
-        if (existsSync(hdPath)) return hdPath
-      }
-      const thumbPath = join(dirPath, `${normalizedKey}_thumb${ext}`)
-      if (existsSync(thumbPath)) return thumbPath
-
-      // 允许返回 _hd 格式（因为它有 _hd 变体后缀）
-      if (!preferHd) {
-        const hdPath = join(dirPath, `${normalizedKey}_hd${ext}`)
-        if (existsSync(hdPath)) return hdPath
-      }
-    }
-    return null
   }
 
   private getCacheOutputPathFromDat(datPath: string, ext: string, sessionId?: string): string {
@@ -1290,6 +1277,52 @@ export class ImageDecryptService {
     }
 
     return join(outputDir, `${normalizedBase}${suffix}${ext}`)
+  }
+
+  private buildCacheOutputCandidatesFromDat(datPath: string, sessionId?: string, preferHd = false): string[] {
+    const name = basename(datPath)
+    const lower = name.toLowerCase()
+    const base = lower.endsWith('.dat') ? name.slice(0, -4) : name
+    const normalizedBase = this.normalizeDatBase(base)
+    const suffixes = preferHd ? ['_hd', '_thumb'] : ['_thumb', '_hd']
+    const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+
+    const root = this.getCacheRoot()
+    const contactDir = this.sanitizeDirName(sessionId || 'unknown')
+    const timeDir = this.resolveTimeDir(datPath)
+    const currentDir = join(root, contactDir, timeDir)
+    const legacyDir = join(root, normalizedBase)
+    const candidates: string[] = []
+
+    for (const suffix of suffixes) {
+      for (const ext of extensions) {
+        candidates.push(join(currentDir, `${normalizedBase}${suffix}${ext}`))
+      }
+    }
+
+    // 兼容旧目录结构
+    for (const suffix of suffixes) {
+      for (const ext of extensions) {
+        candidates.push(join(legacyDir, `${normalizedBase}${suffix}${ext}`))
+      }
+    }
+
+    // 兼容最旧平铺结构
+    for (const ext of extensions) {
+      candidates.push(join(root, `${normalizedBase}${ext}`))
+      candidates.push(join(root, `${normalizedBase}_t${ext}`))
+      candidates.push(join(root, `${normalizedBase}_hd${ext}`))
+    }
+
+    return candidates
+  }
+
+  private findCachedOutputByDatPath(datPath: string, sessionId?: string, preferHd = false): string | null {
+    const candidates = this.buildCacheOutputCandidatesFromDat(datPath, sessionId, preferHd)
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) return candidate
+    }
+    return null
   }
 
   private cacheResolvedPaths(cacheKey: string, imageMd5: string | undefined, imageDatName: string | undefined, outputPath: string): void {
@@ -1334,34 +1367,26 @@ export class ImageDecryptService {
     if (imageDatName) this.updateFlags.delete(imageDatName)
   }
 
-  private getCachedDatDir(accountDir: string, imageDatName?: string, imageMd5?: string): string | null {
-    const keys = [
-      imageDatName ? `${accountDir}|${imageDatName}` : null,
-      imageDatName ? `${accountDir}|${this.normalizeDatBase(imageDatName)}` : null,
-      imageMd5 ? `${accountDir}|${imageMd5}` : null
-    ].filter(Boolean) as string[]
-    for (const key of keys) {
-      const cached = this.resolvedCache.get(key)
-      if (cached && existsSync(cached)) return dirname(cached)
+  private getActiveWindowsSafely(): Array<{ isDestroyed: () => boolean; webContents: { send: (channel: string, payload: unknown) => void } }> {
+    try {
+      const getter = (BrowserWindow as unknown as { getAllWindows?: () => any[] } | undefined)?.getAllWindows
+      if (typeof getter !== 'function') return []
+      const windows = getter()
+      if (!Array.isArray(windows)) return []
+      return windows.filter((win) => (
+        win &&
+        typeof win.isDestroyed === 'function' &&
+        win.webContents &&
+        typeof win.webContents.send === 'function'
+      ))
+    } catch {
+      return []
     }
-    return null
-  }
-
-  private findNonThumbnailVariantInDir(dirPath: string, baseName: string): string | null {
-    return this.findPreferredDatVariantInDir(dirPath, baseName, false)
-  }
-
-  private isNonThumbnailVariantDat(datPath: string): boolean {
-    const lower = basename(datPath).toLowerCase()
-    if (!lower.endsWith('.dat')) return false
-    if (this.isThumbnailDat(lower)) return false
-    const baseLower = lower.slice(0, -4)
-    return this.isLikelyImageDatBase(baseLower)
   }
 
   private emitImageUpdate(payload: { sessionId?: string; imageMd5?: string; imageDatName?: string }, cacheKey: string): void {
     const message = { cacheKey, imageMd5: payload.imageMd5, imageDatName: payload.imageDatName }
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of this.getActiveWindowsSafely()) {
       if (!win.isDestroyed()) {
         win.webContents.send('image:updateAvailable', message)
       }
@@ -1370,7 +1395,7 @@ export class ImageDecryptService {
 
   private emitCacheResolved(payload: { sessionId?: string; imageMd5?: string; imageDatName?: string }, cacheKey: string, localPath: string): void {
     const message = { cacheKey, imageMd5: payload.imageMd5, imageDatName: payload.imageDatName, localPath }
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of this.getActiveWindowsSafely()) {
       if (!win.isDestroyed()) {
         win.webContents.send('image:cacheResolved', message)
       }
@@ -1395,261 +1420,45 @@ export class ImageDecryptService {
       status,
       message: message || ''
     }
-    for (const win of BrowserWindow.getAllWindows()) {
+    for (const win of this.getActiveWindowsSafely()) {
       if (!win.isDestroyed()) {
         win.webContents.send('image:decryptProgress', event)
       }
     }
   }
 
-  private async ensureCacheIndexed(): Promise<void> {
-    if (this.cacheIndexed) return
-    if (this.cacheIndexing) return this.cacheIndexing
-    this.cacheIndexing = (async () => {
-      // 扫描所有可能的缓存根目录
-      const allRoots = this.getAllCacheRoots()
-      this.logInfo('开始索引缓存', { roots: allRoots.length })
-
-      for (const root of allRoots) {
-        try {
-          this.indexCacheDir(root, 3, 0) // 增加深度到 3，支持 sessionId/YYYY-MM 结构
-        } catch (e) {
-          this.logError('索引目录失败', e, { root })
-        }
-      }
-
-      this.logInfo('缓存索引完成', { entries: this.resolvedCache.size })
-      this.cacheIndexed = true
-      this.cacheIndexing = null
-    })()
-    return this.cacheIndexing
-  }
-
-  /**
-   * 获取所有可能的缓存根路径（用于查找已缓存的图片）
-   * 包含当前路径、配置路径、旧版本路径
-   */
-  private getAllCacheRoots(): string[] {
-    const roots: string[] = []
-    const configured = this.configService.get('cachePath')
-    const documentsPath = app.getPath('documents')
-
-    // 主要路径（当前使用的）
-    const mainRoot = this.getCacheRoot()
-    roots.push(mainRoot)
-
-    // 如果配置了自定义路径，也检查其下的 Images
-    if (configured) {
-      roots.push(join(configured, 'Images'))
-      roots.push(join(configured, 'images'))
-    }
-
-    // 默认路径
-    roots.push(join(documentsPath, 'WeFlow', 'Images'))
-    roots.push(join(documentsPath, 'WeFlow', 'images'))
-
-    // 兼容旧路径（如果有的话）
-    roots.push(join(documentsPath, 'WeFlowData', 'Images'))
-
-    // 去重并过滤存在的路径
-    const uniqueRoots = Array.from(new Set(roots))
-    const existingRoots = uniqueRoots.filter(r => existsSync(r))
-
-    return existingRoots
-  }
-
-  private indexCacheDir(root: string, maxDepth: number, depth: number): void {
-    let entries: string[]
-    try {
-      entries = readdirSync(root)
-    } catch {
-      return
-    }
-    const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-    for (const entry of entries) {
-      const fullPath = join(root, entry)
-      let stat: ReturnType<typeof statSync>
-      try {
-        stat = statSync(fullPath)
-      } catch {
-        continue
-      }
-      if (stat.isDirectory()) {
-        if (depth < maxDepth) {
-          this.indexCacheDir(fullPath, maxDepth, depth + 1)
-        }
-        continue
-      }
-      if (!stat.isFile()) continue
-      const lower = entry.toLowerCase()
-      const ext = extensions.find((item) => lower.endsWith(item))
-      if (!ext) continue
-      const base = entry.slice(0, -ext.length)
-      this.addCacheIndex(base, fullPath)
-      const normalized = this.normalizeDatBase(base)
-      if (normalized && normalized !== base.toLowerCase()) {
-        this.addCacheIndex(normalized, fullPath)
-      }
-    }
-  }
-
-  private addCacheIndex(key: string, path: string): void {
-    const normalizedKey = key.toLowerCase()
-    const existing = this.resolvedCache.get(normalizedKey)
-    if (existing) {
-      const existingIsThumb = this.isThumbnailPath(existing)
-      const candidateIsThumb = this.isThumbnailPath(path)
-      if (!existingIsThumb && candidateIsThumb) return
-    }
-    this.resolvedCache.set(normalizedKey, path)
-  }
-
   private getCacheRoot(): string {
     const configured = this.configService.get('cachePath')
     const root = configured
       ? join(configured, 'Images')
-      : join(app.getPath('documents'), 'WeFlow', 'Images')
+      : join(this.getDocumentsPath(), 'WeFlow', 'Images')
     if (!existsSync(root)) {
       mkdirSync(root, { recursive: true })
     }
     return root
   }
 
-  private resolveAesKey(aesKeyRaw: string): Buffer | null {
-    const trimmed = aesKeyRaw?.trim() ?? ''
-    if (!trimmed) return null
-    return this.asciiKey16(trimmed)
-  }
-
-  private async decryptDatAuto(datPath: string, xorKey: number, aesKey: Buffer | null): Promise<Buffer> {
-    const version = this.getDatVersion(datPath)
-
-    if (version === 0) {
-      return this.decryptDatV3(datPath, xorKey)
-    }
-    if (version === 1) {
-      const key = this.asciiKey16(this.defaultV1AesKey)
-      return this.decryptDatV4(datPath, xorKey, key)
-    }
-    // version === 2
-    if (!aesKey || aesKey.length !== 16) {
-      throw new Error('请到设置配置图片解密密钥')
-    }
-    return this.decryptDatV4(datPath, xorKey, aesKey)
-  }
-
-  private getDatVersion(inputPath: string): number {
-    if (!existsSync(inputPath)) {
-      throw new Error('文件不存在')
-    }
-    const bytes = readFileSync(inputPath)
-    if (bytes.length < 6) {
-      return 0
-    }
-    const signature = bytes.subarray(0, 6)
-    if (this.compareBytes(signature, Buffer.from([0x07, 0x08, 0x56, 0x31, 0x08, 0x07]))) {
-      return 1
-    }
-    if (this.compareBytes(signature, Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07]))) {
-      return 2
-    }
-    return 0
-  }
-
-  private decryptDatV3(inputPath: string, xorKey: number): Buffer {
-    const data = readFileSync(inputPath)
-    const out = Buffer.alloc(data.length)
-    for (let i = 0; i < data.length; i += 1) {
-      out[i] = data[i] ^ xorKey
-    }
-    return out
-  }
-
-  private decryptDatV4(inputPath: string, xorKey: number, aesKey: Buffer): Buffer {
-    const bytes = readFileSync(inputPath)
-    if (bytes.length < 0x0f) {
-      throw new Error('文件太小，无法解析')
-    }
-
-    const header = bytes.subarray(0, 0x0f)
-    const data = bytes.subarray(0x0f)
-    const aesSize = this.bytesToInt32(header.subarray(6, 10))
-    const xorSize = this.bytesToInt32(header.subarray(10, 14))
-
-    // AES 数据需要对齐到 16 字节（PKCS7 填充）
-    // 当 aesSize % 16 === 0 时，仍需要额外 16 字节的填充
-    const remainder = ((aesSize % 16) + 16) % 16
-    const alignedAesSize = aesSize + (16 - remainder)
-
-    if (alignedAesSize > data.length) {
-      throw new Error('文件格式异常：AES 数据长度超过文件实际长度')
-    }
-
-    const aesData = data.subarray(0, alignedAesSize)
-    let unpadded: Buffer = Buffer.alloc(0)
-    if (aesData.length > 0) {
-      const decipher = crypto.createDecipheriv('aes-128-ecb', aesKey, null)
-      decipher.setAutoPadding(false)
-      const decrypted = Buffer.concat([decipher.update(aesData), decipher.final()])
-
-      // 使用 PKCS7 填充移除
-      unpadded = this.strictRemovePadding(decrypted)
-    }
-
-    const remaining = data.subarray(alignedAesSize)
-    if (xorSize < 0 || xorSize > remaining.length) {
-      throw new Error('文件格式异常：XOR 数据长度不合法')
-    }
-
-    let rawData = Buffer.alloc(0)
-    let xoredData = Buffer.alloc(0)
-    if (xorSize > 0) {
-      const rawLength = remaining.length - xorSize
-      if (rawLength < 0) {
-        throw new Error('文件格式异常：原始数据长度小于XOR长度')
-      }
-      rawData = remaining.subarray(0, rawLength)
-      const xorData = remaining.subarray(rawLength)
-      xoredData = Buffer.alloc(xorData.length)
-      for (let i = 0; i < xorData.length; i += 1) {
-        xoredData[i] = xorData[i] ^ xorKey
-      }
-    } else {
-      rawData = remaining
-      xoredData = Buffer.alloc(0)
-    }
-
-    return Buffer.concat([unpadded, rawData, xoredData])
-  }
-
-  private bytesToInt32(bytes: Buffer): number {
-    if (bytes.length !== 4) {
-      throw new Error('需要 4 个字节')
-    }
-    return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)
-  }
-
-  asciiKey16(keyString: string): Buffer {
-    if (keyString.length < 16) {
-      throw new Error('AES密钥至少需要 16 个字符')
-    }
-    return Buffer.from(keyString, 'ascii').subarray(0, 16)
-  }
-
-  private strictRemovePadding(data: Buffer): Buffer {
-    if (!data.length) {
-      throw new Error('解密结果为空，填充非法')
-    }
-    const paddingLength = data[data.length - 1]
-    if (paddingLength === 0 || paddingLength > 16 || paddingLength > data.length) {
-      throw new Error('PKCS7 填充长度非法')
-    }
-    for (let i = data.length - paddingLength; i < data.length; i += 1) {
-      if (data[i] !== paddingLength) {
-        throw new Error('PKCS7 填充内容非法')
+  private tryDecryptDatWithNative(
+    datPath: string,
+    xorKey: number,
+    aesKey?: string
+  ): { data: Buffer; ext: string; isWxgf: boolean } | null {
+    const result = decryptDatViaNative(datPath, xorKey, aesKey)
+    if (!this.nativeLogged) {
+      this.nativeLogged = true
+      if (result) {
+        this.logInfo('Rust 原生解密已启用', {
+          addonPath: nativeAddonLocation(),
+          source: 'native'
+        })
+      } else {
+        this.logInfo('Rust 原生解密不可用', {
+          addonPath: nativeAddonLocation(),
+          source: 'native_unavailable'
+        })
       }
     }
-    return data.subarray(0, data.length - paddingLength)
+    return result
   }
 
   private detectImageExtension(buffer: Buffer): string | null {
@@ -1723,91 +1532,6 @@ export class ImageDecryptService {
     return ext === '.gif' || ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp'
   }
 
-  private compareBytes(a: Buffer, b: Buffer): boolean {
-    if (a.length !== b.length) return false
-    for (let i = 0; i < a.length; i += 1) {
-      if (a[i] !== b[i]) return false
-    }
-    return true
-  }
-
-  // 保留原有的批量检测 XOR 密钥方法（用于兼容）
-  async batchDetectXorKey(dirPath: string, maxFiles: number = 100): Promise<number | null> {
-    const keyCount: Map<number, number> = new Map()
-    let filesChecked = 0
-
-    const V1_SIGNATURE = Buffer.from([0x07, 0x08, 0x56, 0x31, 0x08, 0x07])
-    const V2_SIGNATURE = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
-    const IMAGE_SIGNATURES: { [key: string]: Buffer } = {
-      jpg: Buffer.from([0xFF, 0xD8, 0xFF]),
-      png: Buffer.from([0x89, 0x50, 0x4E, 0x47]),
-      gif: Buffer.from([0x47, 0x49, 0x46, 0x38]),
-      bmp: Buffer.from([0x42, 0x4D]),
-      webp: Buffer.from([0x52, 0x49, 0x46, 0x46])
-    }
-
-    const detectXorKeyFromV3 = (header: Buffer): number | null => {
-      for (const [, signature] of Object.entries(IMAGE_SIGNATURES)) {
-        const xorKey = header[0] ^ signature[0]
-        let valid = true
-        for (let i = 0; i < signature.length && i < header.length; i++) {
-          if ((header[i] ^ xorKey) !== signature[i]) {
-            valid = false
-            break
-          }
-        }
-        if (valid) return xorKey
-      }
-      return null
-    }
-
-    const scanDir = (dir: string) => {
-      if (filesChecked >= maxFiles) return
-      try {
-        const entries = readdirSync(dir, { withFileTypes: true })
-        for (const entry of entries) {
-          if (filesChecked >= maxFiles) return
-          const fullPath = join(dir, entry.name)
-          if (entry.isDirectory()) {
-            scanDir(fullPath)
-          } else if (entry.name.endsWith('.dat')) {
-            try {
-              const header = Buffer.alloc(16)
-              const fd = require('fs').openSync(fullPath, 'r')
-              require('fs').readSync(fd, header, 0, 16, 0)
-              require('fs').closeSync(fd)
-
-              if (header.subarray(0, 6).equals(V1_SIGNATURE) || header.subarray(0, 6).equals(V2_SIGNATURE)) {
-                continue
-              }
-
-              const key = detectXorKeyFromV3(header)
-              if (key !== null) {
-                keyCount.set(key, (keyCount.get(key) || 0) + 1)
-                filesChecked++
-              }
-            } catch { }
-          }
-        }
-      } catch { }
-    }
-
-    scanDir(dirPath)
-
-    if (keyCount.size === 0) return null
-
-    let maxCount = 0
-    let mostCommonKey: number | null = null
-    keyCount.forEach((count, key) => {
-      if (count > maxCount) {
-        maxCount = count
-        mostCommonKey = key
-      }
-    })
-
-    return mostCommonKey
-  }
-
   /**
    * 解包 wxgf 格式
    * wxgf 是微信的图片格式，内部使用 HEVC 编码
@@ -1857,45 +1581,39 @@ export class ImageDecryptService {
    * 从 wxgf 数据中提取 HEVC NALU 裸流
    */
   private extractHevcNalu(buffer: Buffer): Buffer | null {
-    const nalUnits: Buffer[] = []
+    const starts: number[] = []
     let i = 4
 
-    while (i < buffer.length - 4) {
-      if (buffer[i] === 0x00 && buffer[i + 1] === 0x00 &&
-        buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01) {
-        let nalStart = i
-        let nalEnd = buffer.length
+    while (i < buffer.length - 3) {
+      const hasPrefix4 = buffer[i] === 0x00 && buffer[i + 1] === 0x00 &&
+        buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01
+      const hasPrefix3 = buffer[i] === 0x00 && buffer[i + 1] === 0x00 &&
+        buffer[i + 2] === 0x01
 
-        for (let j = i + 4; j < buffer.length - 3; j++) {
-          if (buffer[j] === 0x00 && buffer[j + 1] === 0x00) {
-            if (buffer[j + 2] === 0x01 ||
-              (buffer[j + 2] === 0x00 && j + 3 < buffer.length && buffer[j + 3] === 0x01)) {
-              nalEnd = j
-              break
-            }
-          }
-        }
-
-        const nalUnit = buffer.subarray(nalStart, nalEnd)
-        if (nalUnit.length > 3) {
-          nalUnits.push(nalUnit)
-        }
-        i = nalEnd
-      } else {
-        i++
+      if (hasPrefix4 || hasPrefix3) {
+        starts.push(i)
+        i += hasPrefix4 ? 4 : 3
+        continue
       }
+      i += 1
     }
 
-    if (nalUnits.length === 0) {
-      for (let j = 4; j < buffer.length - 4; j++) {
-        if (buffer[j] === 0x00 && buffer[j + 1] === 0x00 &&
-          buffer[j + 2] === 0x00 && buffer[j + 3] === 0x01) {
-          return buffer.subarray(j)
-        }
-      }
-      return null
+    if (starts.length === 0) return null
+
+    const nalUnits: Buffer[] = []
+    for (let index = 0; index < starts.length; index += 1) {
+      const start = starts[index]
+      const end = index + 1 < starts.length ? starts[index + 1] : buffer.length
+      const hasPrefix4 = buffer[start] === 0x00 && buffer[start + 1] === 0x00 &&
+        buffer[start + 2] === 0x00 && buffer[start + 3] === 0x01
+      const prefixLength = hasPrefix4 ? 4 : 3
+      const payloadStart = start + prefixLength
+      if (payloadStart >= end) continue
+      nalUnits.push(Buffer.from([0x00, 0x00, 0x00, 0x01]))
+      nalUnits.push(buffer.subarray(payloadStart, end))
     }
 
+    if (nalUnits.length === 0) return null
     return Buffer.concat(nalUnits)
   }
 
@@ -1921,11 +1639,11 @@ export class ImageDecryptService {
     const ffmpeg = this.getFfmpegPath()
     this.logInfo('ffmpeg 转换开始', { ffmpegPath: ffmpeg, hevcSize: hevcData.length })
 
-    const tmpDir = join(app.getPath('temp'), 'weflow_hevc')
+    const tmpDir = join(this.getTempPath(), 'weflow_hevc')
     if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
-    const ts = Date.now()
-    const tmpInput = join(tmpDir, `hevc_${ts}.hevc`)
-    const tmpOutput = join(tmpDir, `hevc_${ts}.jpg`)
+    const uniqueId = `${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    const tmpInput = join(tmpDir, `hevc_${uniqueId}.hevc`)
+    const tmpOutput = join(tmpDir, `hevc_${uniqueId}.jpg`)
 
     try {
       await writeFile(tmpInput, hevcData)
@@ -1933,6 +1651,7 @@ export class ImageDecryptService {
       // 依次尝试: 1) -f hevc 裸流  2) 不指定格式让 ffmpeg 自动检测
       const attempts: { label: string; inputArgs: string[] }[] = [
         { label: 'hevc raw', inputArgs: ['-f', 'hevc', '-i', tmpInput] },
+        { label: 'h265 raw', inputArgs: ['-f', 'h265', '-i', tmpInput] },
         { label: 'auto detect', inputArgs: ['-i', tmpInput] },
       ]
 
@@ -1961,6 +1680,7 @@ export class ImageDecryptService {
 
       const args = [
         '-hide_banner', '-loglevel', 'error',
+        '-y',
         ...inputArgs,
         '-vframes', '1', '-q:v', '2', '-f', 'image2', tmpOutput
       ]
@@ -2015,11 +1735,6 @@ export class ImageDecryptService {
     return lower.includes('_t.dat') || lower.includes('.t.dat') || lower.includes('_thumb.dat')
   }
 
-  private hasXVariant(base: string): boolean {
-    const lower = base.toLowerCase()
-    return this.stripDatVariantSuffix(lower) !== lower
-  }
-
   private isHdPath(p: string): boolean {
     return p.toLowerCase().includes('_hd') || p.toLowerCase().includes('_h')
   }
@@ -2044,42 +1759,40 @@ export class ImageDecryptService {
     }
   }
 
-  // 保留原有的解密到文件方法（用于兼容）
-  async decryptToFile(inputPath: string, outputPath: string, xorKey: number, aesKey?: Buffer): Promise<void> {
-    const version = this.getDatVersion(inputPath)
-    let decrypted: Buffer
-
-    if (version === 0) {
-      decrypted = this.decryptDatV3(inputPath, xorKey)
-    } else if (version === 1) {
-      const key = this.asciiKey16(this.defaultV1AesKey)
-      decrypted = this.decryptDatV4(inputPath, xorKey, key)
-    } else {
-      if (!aesKey || aesKey.length !== 16) {
-        throw new Error('V4版本需要 16 字节 AES 密钥')
-      }
-      decrypted = this.decryptDatV4(inputPath, xorKey, aesKey)
+  private getElectronPath(name: 'userData' | 'documents' | 'temp'): string | null {
+    try {
+      const getter = (app as unknown as { getPath?: (n: string) => string } | undefined)?.getPath
+      if (typeof getter !== 'function') return null
+      const value = getter(name)
+      return typeof value === 'string' && value.trim() ? value : null
+    } catch {
+      return null
     }
+  }
 
-    const outputDir = dirname(outputPath)
-    if (!existsSync(outputDir)) {
-      mkdirSync(outputDir, { recursive: true })
-    }
+  private getUserDataPath(): string {
+    const workerUserDataPath = String(process.env.WEFLOW_USER_DATA_PATH || process.env.WEFLOW_CONFIG_CWD || '').trim()
+    if (workerUserDataPath) return workerUserDataPath
+    return this.getElectronPath('userData') || process.cwd()
+  }
 
-    await writeFile(outputPath, decrypted)
+  private getDocumentsPath(): string {
+    return this.getElectronPath('documents') || join(homedir(), 'Documents')
+  }
+
+  private getTempPath(): string {
+    return this.getElectronPath('temp') || tmpdir()
   }
 
   async clearCache(): Promise<{ success: boolean; error?: string }> {
     this.resolvedCache.clear()
     this.pending.clear()
     this.updateFlags.clear()
-    this.cacheIndexed = false
-    this.cacheIndexing = null
 
     const configured = this.configService.get('cachePath')
     const root = configured
       ? join(configured, 'Images')
-      : join(app.getPath('documents'), 'WeFlow', 'Images')
+      : join(this.getDocumentsPath(), 'WeFlow', 'Images')
 
     try {
       if (!existsSync(root)) {

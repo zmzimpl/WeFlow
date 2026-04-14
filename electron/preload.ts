@@ -286,22 +286,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // 图片解密
   image: {
-    decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) =>
+    decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; force?: boolean; preferFilePath?: boolean; hardlinkOnly?: boolean }) =>
       ipcRenderer.invoke('image:decrypt', payload),
     resolveCache: (payload: {
       sessionId?: string
       imageMd5?: string
       imageDatName?: string
+      createTime?: number
+      preferFilePath?: boolean
+      hardlinkOnly?: boolean
       disableUpdateCheck?: boolean
       allowCacheIndex?: boolean
     }) =>
       ipcRenderer.invoke('image:resolveCache', payload),
     resolveCacheBatch: (
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; preferFilePath?: boolean; hardlinkOnly?: boolean }>,
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean; preferFilePath?: boolean; hardlinkOnly?: boolean }
     ) => ipcRenderer.invoke('image:resolveCacheBatch', payloads, options),
     preload: (
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }>,
       options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
     ) => ipcRenderer.invoke('image:preload', payloads, options),
     onUpdateAvailable: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => void) => {

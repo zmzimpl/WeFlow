@@ -486,7 +486,7 @@ class ChatService {
     return Number.isFinite(parsed) ? parsed : null
   }
 
-  private toCodeOnlyMessage(rawMessage?: string, fallbackCode = -3999): string {
+  private toCodeOnlyMessage(rawMessage?: string | null, fallbackCode = -3999): string {
     const code = this.extractErrorCode(rawMessage) ?? fallbackCode
     return `错误码: ${code}`
   }
@@ -7105,13 +7105,23 @@ class ChatService {
         return { success: false, error: '未找到消息' }
       }
       const msg = msgResult.message
+      const rawImageInfo = msg.rawContent ? this.parseImageInfo(msg.rawContent) : {}
+      const imageMd5 = msg.imageMd5 || rawImageInfo.md5
+      const imageDatName = msg.imageDatName
 
-      // 2. 使用 imageDecryptService 解密图片
+      if (!imageMd5 && !imageDatName) {
+        return { success: false, error: '图片缺少 md5/datName，无法定位原文件' }
+      }
+
+      // 2. 使用 imageDecryptService 解密图片（仅使用真实图片标识）
       const result = await this.imageDecryptService.decryptImage({
         sessionId,
-        imageMd5: msg.imageMd5,
-        imageDatName: msg.imageDatName || String(msg.localId),
-        force: false
+        imageMd5,
+        imageDatName,
+        createTime: msg.createTime,
+        force: false,
+        preferFilePath: true,
+        hardlinkOnly: true
       })
 
       if (!result.success || !result.localPath) {
@@ -8358,7 +8368,6 @@ class ChatService {
         if (normalized.length === 0) return []
 
         // 规避 native options_json 可能存在的固定缓冲上限：按 payload 字节安全分块。
-        // 这不是降级或裁剪范围，而是完整遍历所有群并做结果合并。
         const maxBytesRaw = Number(process.env.WEFLOW_MY_FOOTPRINT_GROUP_OPTIONS_MAX_BYTES || 900)
         const maxBytes = Number.isFinite(maxBytesRaw) && maxBytesRaw >= 512
           ? Math.floor(maxBytesRaw)
@@ -9325,7 +9334,7 @@ class ChatService {
       latest_ts: this.toSafeInt(item?.latest_ts, 0),
       anchor_local_id: this.toSafeInt(item?.anchor_local_id, 0),
       anchor_create_time: this.toSafeInt(item?.anchor_create_time, 0)
-    })).filter((item) => item.session_id)
+    })).filter((item: MyFootprintPrivateSession) => item.session_id)
 
     const private_segments: MyFootprintPrivateSegment[] = privateSegmentsRaw.map((item: any) => ({
       session_id: String(item?.session_id || '').trim(),
@@ -9344,7 +9353,7 @@ class ChatService {
       anchor_create_time: this.toSafeInt(item?.anchor_create_time, 0),
       displayName: String(item?.displayName || '').trim() || undefined,
       avatarUrl: String(item?.avatarUrl || '').trim() || undefined
-    })).filter((item) => item.session_id && item.start_ts > 0)
+    })).filter((item: MyFootprintPrivateSegment) => item.session_id && item.start_ts > 0)
 
     const mentions: MyFootprintMentionItem[] = mentionsRaw.map((item: any) => ({
       session_id: String(item?.session_id || '').trim(),
@@ -9353,13 +9362,13 @@ class ChatService {
       sender_username: String(item?.sender_username || '').trim(),
       message_content: String(item?.message_content || ''),
       source: String(item?.source || '')
-    })).filter((item) => item.session_id)
+    })).filter((item: MyFootprintMentionItem) => item.session_id)
 
     const mention_groups: MyFootprintMentionGroup[] = mentionGroupsRaw.map((item: any) => ({
       session_id: String(item?.session_id || '').trim(),
       count: this.toSafeInt(item?.count, 0),
       latest_ts: this.toSafeInt(item?.latest_ts, 0)
-    })).filter((item) => item.session_id)
+    })).filter((item: MyFootprintMentionGroup) => item.session_id)
 
     const diagnostics: MyFootprintDiagnostics = {
       truncated: Boolean(diagnosticsRaw.truncated),

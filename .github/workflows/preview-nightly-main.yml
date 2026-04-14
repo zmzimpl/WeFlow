@@ -120,7 +120,6 @@ jobs:
         with:
           node-version: 24
           cache: "npm"
-
       - name: Install Dependencies
         run: npm install
 
@@ -190,7 +189,6 @@ jobs:
         with:
           node-version: 24
           cache: "npm"
-
       - name: Install Dependencies
         run: npm install
 
@@ -242,7 +240,6 @@ jobs:
         with:
           node-version: 24
           cache: "npm"
-
       - name: Install Dependencies
         run: npm install
 
@@ -294,7 +291,6 @@ jobs:
         with:
           node-version: 24
           cache: "npm"
-
       - name: Install Dependencies
         run: npm install
 

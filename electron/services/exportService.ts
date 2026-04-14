@@ -108,7 +108,6 @@ export interface ExportOptions {
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
-  imageDeepSearchOnMiss?: boolean
 }
 
 const TXT_COLUMN_DEFINITIONS: Array<{ id: string; label: string }> = [
@@ -1092,8 +1091,7 @@ class ExportService {
   private getImageMissingRunCacheKey(
     sessionId: string,
     imageMd5?: unknown,
-    imageDatName?: unknown,
-    imageDeepSearchOnMiss = true
+    imageDatName?: unknown
   ): string | null {
     const normalizedSessionId = String(sessionId || '').trim()
     const normalizedImageMd5 = String(imageMd5 || '').trim().toLowerCase()
@@ -1105,8 +1103,7 @@ class ExportService {
     const secondaryToken = normalizedImageMd5 && normalizedImageDatName && normalizedImageDatName !== normalizedImageMd5
       ? normalizedImageDatName
       : ''
-    const lookupMode = imageDeepSearchOnMiss ? 'deep' : 'hardlink'
-    return `${lookupMode}\u001f${normalizedSessionId}\u001f${primaryToken}\u001f${secondaryToken}`
+    return `${normalizedSessionId}\u001f${primaryToken}\u001f${secondaryToken}`
   }
 
   private normalizeEmojiMd5(value: unknown): string | undefined {
@@ -3583,7 +3580,6 @@ class ExportService {
       exportVoiceAsText?: boolean
       includeVideoPoster?: boolean
       includeVoiceWithTranscript?: boolean
-      imageDeepSearchOnMiss?: boolean
       dirCache?: Set<string>
     }
   ): Promise<MediaExportItem | null> {
@@ -3596,8 +3592,7 @@ class ExportService {
         sessionId,
         mediaRootDir,
         mediaRelativePrefix,
-        options.dirCache,
-        options.imageDeepSearchOnMiss !== false
+        options.dirCache
       )
       if (result) {
       }
@@ -3654,8 +3649,7 @@ class ExportService {
     sessionId: string,
     mediaRootDir: string,
     mediaRelativePrefix: string,
-    dirCache?: Set<string>,
-    imageDeepSearchOnMiss = true
+    dirCache?: Set<string>
   ): Promise<MediaExportItem | null> {
     try {
       const imagesDir = path.join(mediaRootDir, mediaRelativePrefix, 'images')
@@ -3675,8 +3669,7 @@ class ExportService {
       const missingRunCacheKey = this.getImageMissingRunCacheKey(
         sessionId,
         imageMd5,
-        imageDatName,
-        imageDeepSearchOnMiss
+        imageDatName
       )
       if (missingRunCacheKey && this.mediaRunMissingImageKeys.has(missingRunCacheKey)) {
         return null
@@ -3686,25 +3679,20 @@ class ExportService {
         sessionId,
         imageMd5,
         imageDatName,
+        createTime: msg.createTime,
         force: true,  // 导出优先高清，失败再回退缩略图
         preferFilePath: true,
-        hardlinkOnly: !imageDeepSearchOnMiss
+        hardlinkOnly: true
       })
 
       if (!result.success || !result.localPath) {
         console.log(`[Export] 图片解密失败 (localId=${msg.localId}): imageMd5=${imageMd5}, imageDatName=${imageDatName}, error=${result.error || '未知'}`)
-        if (!imageDeepSearchOnMiss) {
-          console.log(`[Export] 未命中 hardlink（已关闭缺图深度搜索）→ 将显示 [图片] 占位符`)
-          if (missingRunCacheKey) {
-            this.mediaRunMissingImageKeys.add(missingRunCacheKey)
-          }
-          return null
-        }
         // 尝试获取缩略图
         const thumbResult = await imageDecryptService.resolveCachedImage({
           sessionId,
           imageMd5,
           imageDatName,
+          createTime: msg.createTime,
           preferFilePath: true
         })
         if (thumbResult.success && thumbResult.localPath) {
@@ -5302,7 +5290,6 @@ class ExportService {
               maxFileSizeMb: options.maxFileSizeMb,
               exportVoiceAsText: options.exportVoiceAsText,
               includeVideoPoster: options.format === 'html',
-              imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
               dirCache: mediaDirCache
             })
             mediaCache.set(mediaKey, mediaItem)
@@ -5813,7 +5800,6 @@ class ExportService {
               maxFileSizeMb: options.maxFileSizeMb,
               exportVoiceAsText: options.exportVoiceAsText,
               includeVideoPoster: options.format === 'html',
-              imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
               dirCache: mediaDirCache
             })
             mediaCache.set(mediaKey, mediaItem)
@@ -6685,7 +6671,6 @@ class ExportService {
               maxFileSizeMb: options.maxFileSizeMb,
               exportVoiceAsText: options.exportVoiceAsText,
               includeVideoPoster: options.format === 'html',
-              imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
               dirCache: mediaDirCache
             })
             mediaCache.set(mediaKey, mediaItem)
@@ -7436,7 +7421,6 @@ class ExportService {
               maxFileSizeMb: options.maxFileSizeMb,
               exportVoiceAsText: options.exportVoiceAsText,
               includeVideoPoster: options.format === 'html',
-              imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
               dirCache: mediaDirCache
             })
             mediaCache.set(mediaKey, mediaItem)
@@ -7816,7 +7800,6 @@ class ExportService {
               maxFileSizeMb: options.maxFileSizeMb,
               exportVoiceAsText: options.exportVoiceAsText,
               includeVideoPoster: options.format === 'html',
-              imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
               dirCache: mediaDirCache
             })
             mediaCache.set(mediaKey, mediaItem)
@@ -8240,7 +8223,6 @@ class ExportService {
               includeVideoPoster: options.format === 'html',
               includeVoiceWithTranscript: true,
               exportVideos: options.exportVideos,
-              imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
               dirCache: mediaDirCache
             })
             mediaCache.set(mediaKey, mediaItem)

@@ -491,24 +491,35 @@ export interface ElectronAPI {
   }
 
   image: {
-    decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => Promise<{ success: boolean; localPath?: string; liveVideoPath?: string; error?: string }>
+    decrypt: (payload: {
+      sessionId?: string
+      imageMd5?: string
+      imageDatName?: string
+      createTime?: number
+      force?: boolean
+      preferFilePath?: boolean
+      hardlinkOnly?: boolean
+    }) => Promise<{ success: boolean; localPath?: string; liveVideoPath?: string; error?: string }>
     resolveCache: (payload: {
       sessionId?: string
       imageMd5?: string
       imageDatName?: string
+      createTime?: number
+      preferFilePath?: boolean
+      hardlinkOnly?: boolean
       disableUpdateCheck?: boolean
       allowCacheIndex?: boolean
     }) => Promise<{ success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string }>
     resolveCacheBatch: (
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number; preferFilePath?: boolean; hardlinkOnly?: boolean }>,
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean; preferFilePath?: boolean; hardlinkOnly?: boolean }
     ) => Promise<{
       success: boolean
       rows?: Array<{ success: boolean; localPath?: string; hasUpdate?: boolean; error?: string }>
       error?: string
     }>
     preload: (
-      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }>,
       options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
     ) => Promise<boolean>
     onUpdateAvailable: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => void) => () => void
@@ -1117,7 +1128,6 @@ export interface ExportOptions {
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
-  imageDeepSearchOnMiss?: boolean
 }
 
 export interface ExportProgress {
